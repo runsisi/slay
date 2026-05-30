@@ -8,8 +8,6 @@ use anyhow::{Context, Result, bail};
 use russh::keys::{HashAlg, PublicKey};
 use serde::Deserialize;
 
-use crate::token::validate_token_hash;
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfigFile {
@@ -17,37 +15,30 @@ pub struct RelayConfigFile {
     #[serde(default)]
     pub users: HashMap<String, RelayUserConfig>,
     #[serde(default)]
-    pub machines: HashMap<String, MachineConfig>,
+    pub agents: HashMap<String, RelayAgentConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayServerConfig {
     pub ssh_listen: SocketAddr,
-    pub relay_listen: SocketAddr,
     pub ssh_host_key: PathBuf,
-    pub relay_tls_cert: Option<PathBuf>,
-    pub relay_tls_key: Option<PathBuf>,
-    #[serde(default)]
-    pub allow_insecure_relay: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayUserConfig {
     #[serde(default)]
-    pub public_keys: Vec<String>,
+    pub authorized_keys: Vec<String>,
     #[serde(default)]
-    pub allowed_machines: Vec<String>,
+    pub allowed_agents: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MachineConfig {
-    pub machine_id: String,
-    pub machine_alias: String,
-    pub display_name: Option<String>,
-    pub agent_token_hash: String,
+pub struct RelayAgentConfig {
+    #[serde(default)]
+    pub agent_authorized_keys: Vec<String>,
     pub target: String,
 }
 
@@ -55,36 +46,34 @@ pub struct MachineConfig {
 pub struct RelayConfig {
     pub server: RuntimeRelayServerConfig,
     users: Arc<HashMap<String, RuntimeRelayUser>>,
-    machines_by_id: Arc<HashMap<String, MachineConfig>>,
-    machines_by_alias: Arc<HashMap<String, MachineConfig>>,
+    agents_by_id: Arc<HashMap<String, RuntimeAgent>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RuntimeRelayServerConfig {
     pub ssh_listen: SocketAddr,
-    pub relay_listen: SocketAddr,
     pub ssh_host_key: PathBuf,
-    pub relay_tls_cert: Option<PathBuf>,
-    pub relay_tls_key: Option<PathBuf>,
-    pub allow_insecure_relay: bool,
 }
 
 #[derive(Clone, Debug)]
 struct RuntimeRelayUser {
     key_fingerprints: HashSet<String>,
-    allowed_machines: HashSet<String>,
+    allowed_agents: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeAgent {
+    config: RelayAgentConfig,
+    agent_key_fingerprints: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub relay_addr: String,
-    pub relay_name: Option<String>,
-    pub relay_ca_cert: Option<PathBuf>,
-    #[serde(default)]
-    pub allow_insecure_relay: bool,
-    pub machine_id: String,
-    pub agent_token: String,
+    pub relay_host_key: String,
+    pub agent_id: String,
+    pub agent_private_key: PathBuf,
     pub target: String,
     #[serde(default = "default_reconnect_secs")]
     pub reconnect_secs: u64,
@@ -111,70 +100,65 @@ impl RelayConfig {
         if file.users.is_empty() {
             bail!("relay config must define at least one user");
         }
-        if file.machines.is_empty() {
-            bail!("relay config must define at least one machine");
+        if file.agents.is_empty() {
+            bail!("relay config must define at least one agent");
         }
 
-        let tls_pair_complete =
-            file.server.relay_tls_cert.is_some() == file.server.relay_tls_key.is_some();
-        if !tls_pair_complete {
-            bail!("relay_tls_cert and relay_tls_key must be configured together");
-        }
-        if file.server.relay_tls_cert.is_none() && !file.server.allow_insecure_relay {
-            bail!(
-                "relay TLS is required; configure relay_tls_cert/relay_tls_key or set allow_insecure_relay = true for local development"
+        let mut agents_by_id = HashMap::new();
+        for (agent_id, agent) in file.agents {
+            validate_identifier("agent_id", &agent_id)?;
+            if agent.agent_authorized_keys.is_empty() {
+                bail!("agent {agent_id} must have at least one agent authorized key");
+            }
+            if agent.target != "127.0.0.1:22" {
+                bail!("agent {agent_id} target must be 127.0.0.1:22 for the SSH-only MVP");
+            }
+            let mut agent_key_fingerprints = HashSet::new();
+            for public_key in &agent.agent_authorized_keys {
+                let key = parse_public_key(public_key).with_context(|| {
+                    format!("invalid agent authorized key for agent {agent_id}")
+                })?;
+                agent_key_fingerprints.insert(fingerprint(&key));
+            }
+            agents_by_id.insert(
+                agent_id,
+                RuntimeAgent {
+                    config: agent,
+                    agent_key_fingerprints,
+                },
             );
-        }
-
-        let mut machines_by_id = HashMap::new();
-        let mut machines_by_alias = HashMap::new();
-        for (entry_name, machine) in file.machines {
-            validate_identifier("machine_id", &machine.machine_id)?;
-            validate_identifier("machine_alias", &machine.machine_alias)?;
-            validate_token_hash(&machine.agent_token_hash)?;
-            if machine.target != "127.0.0.1:22" {
-                bail!("machine {entry_name} target must be 127.0.0.1:22 for the SSH-only MVP");
-            }
-            if machines_by_id
-                .insert(machine.machine_id.clone(), machine.clone())
-                .is_some()
-            {
-                bail!("duplicate machine_id {}", machine.machine_id);
-            }
-            if machines_by_alias
-                .insert(machine.machine_alias.clone(), machine)
-                .is_some()
-            {
-                bail!("duplicate machine_alias in relay config");
-            }
         }
 
         let mut users = HashMap::new();
         for (name, user) in file.users {
-            if user.public_keys.is_empty() {
-                bail!("user {name} must have at least one public key");
+            validate_identifier("user", &name)?;
+            if agents_by_id.contains_key(&name) {
+                bail!("relay user {name} conflicts with an agent_id");
+            }
+            if user.authorized_keys.is_empty() {
+                bail!("user {name} must have at least one authorized key");
             }
 
             let mut key_fingerprints = HashSet::new();
-            for public_key in user.public_keys {
+            for public_key in user.authorized_keys {
                 let key = parse_public_key(&public_key)
-                    .with_context(|| format!("invalid public key for user {name}"))?;
+                    .with_context(|| format!("invalid authorized key for user {name}"))?;
                 key_fingerprints.insert(fingerprint(&key));
             }
 
-            let mut allowed_machines = HashSet::new();
-            for alias in user.allowed_machines {
-                if !machines_by_alias.contains_key(&alias) {
-                    bail!("user {name} references unknown machine alias {alias}");
+            let mut allowed_agents = HashSet::new();
+            for agent_id in user.allowed_agents {
+                if !agents_by_id.contains_key(&agent_id) {
+                    bail!("user {name} references unknown agent id {agent_id}");
                 }
-                allowed_machines.insert(alias);
+                allowed_agents.insert(agent_id);
             }
 
             users.insert(
                 name,
                 RuntimeRelayUser {
                     key_fingerprints,
-                    allowed_machines,
+                    allowed_agents,
                 },
             );
         }
@@ -182,15 +166,10 @@ impl RelayConfig {
         Ok(Self {
             server: RuntimeRelayServerConfig {
                 ssh_listen: file.server.ssh_listen,
-                relay_listen: file.server.relay_listen,
                 ssh_host_key: file.server.ssh_host_key,
-                relay_tls_cert: file.server.relay_tls_cert,
-                relay_tls_key: file.server.relay_tls_key,
-                allow_insecure_relay: file.server.allow_insecure_relay,
             },
             users: Arc::new(users),
-            machines_by_id: Arc::new(machines_by_id),
-            machines_by_alias: Arc::new(machines_by_alias),
+            agents_by_id: Arc::new(agents_by_id),
         })
     }
 
@@ -200,18 +179,20 @@ impl RelayConfig {
             .is_some_and(|entry| entry.key_fingerprints.contains(&fingerprint(key)))
     }
 
-    pub fn user_can_access(&self, user: &str, machine_alias: &str) -> bool {
+    pub fn agent_key_allowed(&self, agent_id: &str, key: &PublicKey) -> bool {
+        self.agents_by_id
+            .get(agent_id)
+            .is_some_and(|entry| entry.agent_key_fingerprints.contains(&fingerprint(key)))
+    }
+
+    pub fn user_can_access(&self, user: &str, agent_id: &str) -> bool {
         self.users
             .get(user)
-            .is_some_and(|entry| entry.allowed_machines.contains(machine_alias))
+            .is_some_and(|entry| entry.allowed_agents.contains(agent_id))
     }
 
-    pub fn machine_by_id(&self, machine_id: &str) -> Option<&MachineConfig> {
-        self.machines_by_id.get(machine_id)
-    }
-
-    pub fn machine_by_alias(&self, machine_alias: &str) -> Option<&MachineConfig> {
-        self.machines_by_alias.get(machine_alias)
+    pub fn agent_by_id(&self, agent_id: &str) -> Option<&RelayAgentConfig> {
+        self.agents_by_id.get(agent_id).map(|entry| &entry.config)
     }
 }
 
@@ -225,27 +206,16 @@ impl AgentConfig {
         Ok(config)
     }
 
-    pub fn relay_server_name(&self) -> Result<String> {
-        if let Some(name) = &self.relay_name {
-            return Ok(name.clone());
-        }
-
-        let host = self
-            .relay_addr
-            .rsplit_once(':')
-            .map(|(host, _)| host)
-            .unwrap_or(&self.relay_addr);
-        if host.is_empty() {
-            bail!("relay_addr does not contain a relay host");
-        }
-        Ok(host.to_string())
+    pub fn relay_host_public_key(&self) -> Result<PublicKey> {
+        parse_public_key(&self.relay_host_key).context("invalid relay_host_key")
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_identifier("machine_id", &self.machine_id)?;
-        if self.agent_token.len() < 32 {
-            bail!("agent_token must be at least 32 characters");
+        if self.relay_addr.is_empty() {
+            bail!("relay_addr cannot be empty");
         }
+        self.relay_host_public_key()?;
+        validate_identifier("agent_id", &self.agent_id)?;
         if self.reconnect_secs == 0 {
             bail!("reconnect_secs must be at least 1");
         }
@@ -270,9 +240,9 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
     }
     let valid = value
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
     if !valid {
-        bail!("{label} {value:?} may only contain ASCII letters, digits, '_', '-' and '.'");
+        bail!("{label} {value:?} may only contain ASCII letters, digits, '_' and '-'");
     }
     Ok(())
 }
@@ -280,10 +250,6 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::{
-        Argon2, PasswordHasher,
-        password_hash::{SaltString, rand_core::OsRng},
-    };
     use russh::keys::{Algorithm, PrivateKey};
 
     fn public_key_line() -> String {
@@ -291,63 +257,49 @@ mod tests {
         key.public_key().to_openssh().unwrap()
     }
 
-    fn token_hash(token: &str) -> String {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(token.as_bytes(), &salt)
-            .unwrap()
-            .to_string()
-    }
-
-    fn base_config(machine_alias: &str) -> String {
+    fn base_config(agent_id: &str) -> String {
+        let user_key = public_key_line();
+        let agent_key = public_key_line();
         format!(
             r#"
 [server]
 ssh_listen = "127.0.0.1:2222"
-relay_listen = "127.0.0.1:4443"
 ssh_host_key = "/tmp/slay-test-host-key"
-allow_insecure_relay = true
 
 [users.alice]
-public_keys = ["{}"]
-allowed_machines = ["{}"]
+authorized_keys = ["{}"]
+allowed_agents = ["{}"]
 
-[machines.alice_home]
-machine_id = "mch_01"
-machine_alias = "{}"
-display_name = "Alice Home"
-agent_token_hash = "{}"
+[agents.{}]
+agent_authorized_keys = ["{}"]
 target = "127.0.0.1:22"
 "#,
-            public_key_line(),
-            machine_alias,
-            machine_alias,
-            token_hash("01234567890123456789012345678901")
+            user_key, agent_id, agent_id, agent_key
         )
     }
 
     #[test]
-    fn validates_machine_alias_acl() {
+    fn validates_agent_id_acl() {
         let config = RelayConfig::from_toml_str(&base_config("alice-home-linux")).unwrap();
         assert!(config.user_can_access("alice", "alice-home-linux"));
         assert!(!config.user_can_access("alice", "alice-office-linux"));
     }
 
     #[test]
-    fn rejects_acl_for_unknown_machine() {
+    fn rejects_acl_for_unknown_agent() {
         let raw = base_config("alice-home-linux").replace(
-            "allowed_machines = [\"alice-home-linux\"]",
-            "allowed_machines = [\"missing\"]",
+            "allowed_agents = [\"alice-home-linux\"]",
+            "allowed_agents = [\"missing\"]",
         );
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
-        assert!(err.to_string().contains("unknown machine alias"));
+        assert!(err.to_string().contains("unknown agent id"));
     }
 
     #[test]
-    fn empty_acl_allows_no_machines() {
+    fn empty_acl_allows_no_agents() {
         let raw = base_config("alice-home-linux").replace(
-            "allowed_machines = [\"alice-home-linux\"]",
-            "allowed_machines = []",
+            "allowed_agents = [\"alice-home-linux\"]",
+            "allowed_agents = []",
         );
         let config = RelayConfig::from_toml_str(&raw).unwrap();
         assert!(!config.user_can_access("alice", "alice-home-linux"));
@@ -362,17 +314,23 @@ target = "127.0.0.1:22"
     }
 
     #[test]
-    fn rejects_relay_config_without_tls_or_insecure_flag() {
-        let raw = base_config("alice-home-linux").replace("allow_insecure_relay = true\n", "");
+    fn rejects_agent_without_agent_authorized_key() {
+        let raw = base_config("alice-home-linux");
+        let line = raw
+            .lines()
+            .find(|line| line.trim_start().starts_with("agent_authorized_keys = "))
+            .unwrap()
+            .to_string();
+        let raw = raw.replace(&line, "agent_authorized_keys = []");
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
-        assert!(err.to_string().contains("relay TLS is required"));
+        assert!(err.to_string().contains("agent authorized key"));
     }
 
     #[test]
     fn rejects_unknown_relay_server_field() {
         let raw = base_config("alice-home-linux").replace(
-            "allow_insecure_relay = true",
-            "allow_insecure_relay = true\nunexpected_field = true",
+            "ssh_host_key = \"/tmp/slay-test-host-key\"",
+            "ssh_host_key = \"/tmp/slay-test-host-key\"\nunexpected_field = true",
         );
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
         assert!(format!("{err:#}").contains("unknown field"));
@@ -381,10 +339,11 @@ target = "127.0.0.1:22"
     #[test]
     fn rejects_unknown_agent_field() {
         let raw = r#"
-relay_addr = "relay.example.com:443"
+relay_addr = "relay.example.com:2222"
+relay_host_key = "ssh-ed25519 AAAA relay@example"
 unexpected_field = true
-machine_id = "mch_01"
-agent_token = "01234567890123456789012345678901"
+agent_id = "alice-home-linux"
+agent_private_key = "/etc/slay/agent_ed25519"
 target = "127.0.0.1:22"
 "#;
         let err = toml::from_str::<AgentConfig>(raw).unwrap_err();
@@ -392,25 +351,34 @@ target = "127.0.0.1:22"
     }
 
     #[test]
-    fn rejects_invalid_agent_token_hash() {
-        let raw = base_config("alice-home-linux").replace(
-            "agent_token_hash = \"",
-            "agent_token_hash = \"not-a-valid-hash",
-        );
+    fn rejects_agent_user_name_conflict() {
+        let raw =
+            base_config("alice-home-linux").replace("[users.alice]", "[users.alice-home-linux]");
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
-        assert!(err.to_string().contains("invalid agent_token_hash"));
+        assert!(err.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn rejects_agent_id_with_dot() {
+        let raw =
+            base_config("alice-home").replace("[agents.alice-home]", "[agents.\"alice.home\"]");
+        let err = RelayConfig::from_toml_str(&raw).unwrap_err();
+        assert!(err.to_string().contains("agent_id"));
     }
 
     #[test]
     fn rejects_zero_reconnect_delay() {
+        let relay_key = public_key_line();
         let raw = r#"
-relay_addr = "relay.example.com:443"
-machine_id = "mch_01"
-agent_token = "01234567890123456789012345678901"
+relay_addr = "relay.example.com:2222"
+relay_host_key = "RELAY_KEY"
+agent_id = "mch_01"
+agent_private_key = "/etc/slay/agent_ed25519"
 target = "127.0.0.1:22"
 reconnect_secs = 0
-"#;
-        let config: AgentConfig = toml::from_str(raw).unwrap();
+"#
+        .replace("RELAY_KEY", &relay_key);
+        let config: AgentConfig = toml::from_str(&raw).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("reconnect_secs"));
     }

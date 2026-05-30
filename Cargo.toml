@@ -5,22 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-argon2 = "0.5"
-base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-futures = "0.3"
-rand_core = { version = "0.6", features = ["getrandom"] }
 rand = "0.10"
-rcgen = "0.14.8"
 russh = "0.61.1"
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = "0.26"
-tokio-yamux = "0.3.18"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-webpki-roots = "0.26"

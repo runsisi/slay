@@ -1,174 +1,131 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures::StreamExt;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use russh::Channel;
+use russh::client;
+use russh::client::Msg;
+use russh::keys::key::PrivateKeyWithHashAlg;
+use russh::keys::load_secret_key;
 use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_yamux::config::Config as YamuxConfig;
-use tokio_yamux::session::Session as YamuxSession;
-use tokio_yamux::stream::StreamHandle;
 use tracing::{debug, info, warn};
 
-use crate::agent_protocol::{
-    AgentHello, AgentHelloResponse, OpenStreamRequest, OpenStreamResponse, PROTOCOL_VERSION,
-    read_json_line, write_json_line,
-};
-use crate::config::AgentConfig;
-use crate::tls;
+use crate::config::{AgentConfig, fingerprint};
 
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
     loop {
         match connect_once(config.clone()).await {
-            Ok(()) => warn!("agent connection closed"),
-            Err(err) => warn!(error = %err, "agent connection failed"),
+            Ok(()) => warn!("agent SSH connection closed"),
+            Err(err) => warn!(error = %err, "agent SSH connection failed"),
         }
         tokio::time::sleep(Duration::from_secs(config.reconnect_secs)).await;
     }
 }
 
 async fn connect_once(config: AgentConfig) -> Result<()> {
-    let tcp = TcpStream::connect(&config.relay_addr)
-        .await
-        .with_context(|| format!("failed to connect relay {}", config.relay_addr))?;
-    let stream = if config.allow_insecure_relay {
-        warn!("agent is connecting without TLS because allow_insecure_relay is enabled");
-        EitherStream::Plain(tcp)
-    } else {
-        let client_config = tls::client_config(config.relay_ca_cert.as_deref())?;
-        let connector = TlsConnector::from(client_config);
-        let server_name = ServerName::try_from(config.relay_server_name()?)
-            .context("invalid relay TLS server name")?;
-        EitherStream::Tls(Box::new(
-            connector
-                .connect(server_name, tcp)
-                .await
-                .context("agent TLS handshake failed")?,
-        ))
+    let expected_relay_host_key = config.relay_host_public_key()?;
+    let expected_relay_host_key_fingerprint = fingerprint(&expected_relay_host_key);
+    let agent_key = load_secret_key(&config.agent_private_key, None).with_context(|| {
+        format!(
+            "failed to load agent private key {}",
+            config.agent_private_key.display()
+        )
+    })?;
+    let client_config = Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(3600)),
+        nodelay: true,
+        ..Default::default()
+    });
+    let handler = AgentSshClient {
+        expected_relay_host_key_fingerprint,
+        agent_id: config.agent_id.clone(),
+        target: config.target.clone(),
     };
 
-    run_authenticated_session(config, stream).await
-}
-
-async fn run_authenticated_session<S>(config: AgentConfig, mut stream: S) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let hello = AgentHello {
-        version: PROTOCOL_VERSION,
-        machine_id: config.machine_id.clone(),
-        agent_token: config.agent_token.clone(),
-    };
-    write_json_line(&mut stream, &hello).await?;
-    let response: AgentHelloResponse = read_json_line(&mut stream).await?;
-    if !response.ok {
-        bail!(
-            "relay rejected agent: {}",
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        );
-    }
-    info!(machine_id = %config.machine_id, "agent authenticated");
-
-    let mut session = YamuxSession::new_server(stream, YamuxConfig::default());
-    while let Some(result) = session.next().await {
-        match result {
-            Ok(stream) => {
-                let config = config.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_stream(config, stream).await {
-                        debug!(error = %err, "agent stream ended");
-                    }
-                });
-            }
-            Err(err) => {
-                return Err(err).context("yamux session error");
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn handle_stream(config: AgentConfig, mut relay_stream: StreamHandle) -> Result<()> {
-    let request: OpenStreamRequest = read_json_line(&mut relay_stream).await?;
-    if request.version != PROTOCOL_VERSION {
-        write_json_line(
-            &mut relay_stream,
-            &OpenStreamResponse::reject("unsupported protocol version"),
-        )
-        .await?;
-        bail!("unsupported stream protocol version {}", request.version);
-    }
-    if request.target != config.target {
-        write_json_line(
-            &mut relay_stream,
-            &OpenStreamResponse::reject("target is not allowed by agent config"),
-        )
-        .await?;
-        bail!("relay requested disallowed target {}", request.target);
-    }
-
-    let mut target = TcpStream::connect(&config.target)
+    let mut session = client::connect(client_config, config.relay_addr.as_str(), handler)
         .await
-        .with_context(|| format!("failed to connect local target {}", config.target))?;
-    write_json_line(&mut relay_stream, &OpenStreamResponse::ok()).await?;
-    tokio::io::copy_bidirectional(&mut relay_stream, &mut target)
+        .context("failed to connect relay SSH")?;
+    let hash_alg = session.best_supported_rsa_hash().await?.flatten();
+    let auth = session
+        .authenticate_publickey(
+            config.agent_id.clone(),
+            PrivateKeyWithHashAlg::new(Arc::new(agent_key), hash_alg),
+        )
         .await
-        .context("agent stream copy failed")?;
-    let _ = relay_stream.shutdown().await;
-    let _ = target.shutdown().await;
+        .context("agent SSH public key authentication failed")?;
+    if !auth.success() {
+        bail!("relay rejected agent SSH public key authentication");
+    }
+
+    session
+        .tcpip_forward(config.agent_id.clone(), 22)
+        .await
+        .context("relay rejected agent reverse forwarding request")?;
+    info!(
+        agent_id = %config.agent_id,
+        target = %config.target,
+        "agent registered SSH reverse forwarding"
+    );
+
+    session.await.context("agent SSH session ended")
+}
+
+struct AgentSshClient {
+    expected_relay_host_key_fingerprint: String,
+    agent_id: String,
+    target: String,
+}
+
+impl client::Handler for AgentSshClient {
+    type Error = anyhow::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(fingerprint(server_public_key) == self.expected_relay_host_key_fingerprint)
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if connected_address != self.agent_id || connected_port != 22 {
+            bail!(
+                "relay opened unexpected forwarded channel to {connected_address}:{connected_port}"
+            );
+        }
+
+        let target = self.target.clone();
+        let agent_id = self.agent_id.clone();
+        let originator_address = originator_address.to_string();
+        tokio::spawn(async move {
+            if let Err(err) = forward_channel_to_target(channel, &target).await {
+                debug!(
+                    agent_id,
+                    originator_address,
+                    originator_port,
+                    error = %err,
+                    "forwarded SSH channel ended"
+                );
+            }
+        });
+        Ok(())
+    }
+}
+
+async fn forward_channel_to_target(channel: Channel<Msg>, target: &str) -> Result<()> {
+    let mut target_stream = TcpStream::connect(target)
+        .await
+        .with_context(|| format!("failed to connect local target {target}"))?;
+    let mut ssh_stream = channel.into_stream();
+    tokio::io::copy_bidirectional(&mut ssh_stream, &mut target_stream)
+        .await
+        .context("agent forwarded channel copy failed")?;
     Ok(())
-}
-
-enum EitherStream {
-    Plain(TcpStream),
-    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
-}
-
-impl AsyncRead for EitherStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            Self::Plain(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for EitherStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match &mut *self {
-            Self::Plain(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            Self::Plain(stream) => std::pin::Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            Self::Plain(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_shutdown(cx),
-        }
-    }
 }

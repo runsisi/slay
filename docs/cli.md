@@ -10,7 +10,7 @@ Run the VPS relay:
 slay relay --config slay-relay.toml
 ```
 
-Run the machine agent on an internal machine:
+Run the agent on an internal machine:
 
 ```bash
 slay agent --config slay-agent.toml
@@ -18,74 +18,51 @@ slay agent --config slay-agent.toml
 
 ## Config Commands
 
-Create matching relay and agent configs with a generated `machine_id`, `agent_token`, and `agent_token_hash`:
+Create matching relay and agent configs:
 
 ```bash
 slay config init \
   --relay-output slay-relay.toml \
   --agent-output slay-agent.toml \
-  --relay-addr relay.example.com:443 \
-  --relay-name relay.example.com \
+  --relay-addr relay.example.com:2222 \
   --relay-user alice \
-  --relay-authorized-key ~/.ssh/id_relay.pub \
-  --tls-dir ./slay-tls
+  --relay-authorized-key ~/.ssh/id_relay_user.pub \
+  --agent-authorized-key ~/.ssh/id_slay_agent.pub \
+  --relay-host-public-key /etc/slay/relay_host_ed25519.pub \
+  --agent-private-key /etc/slay/agent_ed25519
 ```
 
-By default this uses `--relay-tls private-ca`, creates a private CA plus a relay server certificate in `--tls-dir`, writes `relay_ca_cert` from that directory into the agent config, and writes relay runtime TLS paths such as `/etc/slay/relay.crt` and `/etc/slay/relay.key` into the relay config.
-
-Set the machine alias and display name during paired generation:
-
-```bash
-slay config init \
-  --relay-addr relay.example.com:443 \
-  --relay-authorized-key ~/.ssh/id_relay.pub \
-  --machine-alias alice-home-linux \
-  --display-name "Alice Home Linux"
-```
-
-`--relay-addr` is required because it is written into the agent config and used for generated TLS certificates. `--relay-authorized-key` is optional; if omitted, replace the placeholder public key before validating or running the relay.
+`--relay-addr` is the SSH address used by the agent to connect back to the relay. The relay SSH host key is written to `relay_host_key` in the agent config so the agent can verify the relay before authenticating.
 
 Authorize multiple SSH client keys for the relay user:
 
 ```bash
 slay config init \
-  --relay-addr relay.example.com:443 \
+  --relay-addr relay.example.com:2222 \
   --relay-authorized-key ~/.ssh/id_laptop.pub \
   --relay-authorized-key ~/.ssh/id_phone.pub
 ```
 
-Or read an OpenSSH-style `authorized_keys` file:
+Read OpenSSH-style `authorized_keys` files:
 
 ```bash
 slay config init \
-  --relay-addr relay.example.com:443 \
-  --relay-authorized-keys ~/.ssh/authorized_keys
+  --relay-addr relay.example.com:2222 \
+  --relay-authorized-keys ~/.ssh/authorized_keys \
+  --agent-authorized-keys ./agent_authorized_keys
 ```
 
-Select relay-link TLS mode:
+Set the agent id during paired generation:
 
 ```bash
-# Default: generate a private CA and relay certificate.
-slay config init --relay-addr relay.example.com:443 --relay-authorized-key ~/.ssh/id_relay.pub --relay-tls private-ca --tls-dir ./slay-tls
-
-# Use externally managed TLS files, such as a public CA certificate.
-slay config init --relay-addr relay.example.com:443 --relay-authorized-key ~/.ssh/id_relay.pub --relay-tls external
-
-# Local development only.
-slay config init --relay-addr 127.0.0.1:4443 --relay-authorized-key ~/.ssh/id_relay.pub --relay-tls insecure
+slay config init \
+  --relay-addr relay.example.com:2222 \
+  --relay-authorized-key ~/.ssh/id_relay_user.pub \
+  --agent-authorized-key ~/.ssh/id_slay_agent.pub \
+  --agent-id alice-home-linux
 ```
 
-`private-ca` creates:
-
-```text
-slay-tls/
-  relay-ca.crt
-  relay-ca.key
-  relay.crt
-  relay.key
-```
-
-Keep `relay-ca.key` and `relay.key` private. Do not copy `relay-ca.key` to agent machines.
+If relay user keys, agent keys, or the relay host public key are omitted, `config init` writes placeholders. Replace them before validating or running.
 
 Generate a relay config:
 
@@ -111,111 +88,65 @@ Print generated config to stdout:
 slay config gen relay --output -
 ```
 
-Validate a relay config:
+Validate configs:
 
 ```bash
 slay config validate relay --config slay-relay.toml
-```
-
-Validate an agent config:
-
-```bash
 slay config validate agent --config slay-agent.toml
-```
-
-Generate a new random agent token and its relay-side hash without writing config files:
-
-```bash
-slay config token
-```
-
-Hash an existing agent token without writing config files:
-
-```bash
-slay config hash-token 'at-least-32-random-characters-here'
 ```
 
 ## Minimal Setup Flow
 
-1. Create matching relay and agent configs:
+1. Create or choose SSH keys:
+
+```bash
+ssh-keygen -t ed25519 -f /etc/slay/relay_host_ed25519 -N ''
+ssh-keygen -t ed25519 -f /etc/slay/agent_ed25519 -N ''
+```
+
+Use a normal user SSH public key for `--relay-authorized-key`. Use `/etc/slay/agent_ed25519.pub` for `--agent-authorized-key`.
+
+2. Create matching relay and agent configs:
 
 ```bash
 slay config init \
   --relay-output slay-relay.toml \
   --agent-output slay-agent.toml \
-  --relay-addr relay.example.com:443 \
-  --relay-name relay.example.com \
+  --relay-addr relay.example.com:2222 \
   --relay-user alice \
-  --relay-authorized-key ~/.ssh/id_relay.pub \
-  --relay-tls private-ca \
-  --tls-dir ./slay-tls \
-  --machine-alias alice-home-linux \
-  --display-name "Alice Home Linux"
+  --relay-authorized-key ~/.ssh/id_ed25519.pub \
+  --agent-authorized-key /etc/slay/agent_ed25519.pub \
+  --relay-host-public-key /etc/slay/relay_host_ed25519.pub \
+  --agent-private-key /etc/slay/agent_ed25519 \
+  --agent-id alice-home-linux
 ```
 
-2. Edit `slay-relay.toml`:
+3. Edit `slay-relay.toml`:
 
-- Set the relay SSH host key path.
-- Deploy `relay.crt` and `relay.key` to the configured `relay_tls_cert` and `relay_tls_key` paths, for example under `/etc/slay`.
-- Confirm the relay user public key.
-- Keep `machine_alias` unique.
+- Set `[server].ssh_host_key` to the relay host private key.
+- Confirm `[users.<name>].authorized_keys`.
+- Confirm `[agents.<agent_id>].agent_authorized_keys`.
+- Keep each `[agents.<agent_id>]` table key unique.
 
-3. Edit `slay-agent.toml`:
+4. Edit `slay-agent.toml`:
 
-- Confirm `relay_addr` and `relay_name`.
-- Keep `relay_ca_cert` when using `--relay-tls private-ca`; omit it only when the relay certificate uses a public CA.
-- Use the same `machine_id` configured in relay config.
-- Keep the generated `agent_token`.
+- Confirm `relay_addr`.
+- Confirm `relay_host_key` matches the relay SSH host public key.
+- Confirm `agent_id` matches the relay `[agents.<agent_id>]` entry.
+- Confirm `agent_private_key` points to the private half of a relay `agent_authorized_keys` entry.
 
-For local development only, generate plain relay links explicitly:
-
-```bash
-slay config init --relay-addr 127.0.0.1:4443 --relay-authorized-key ~/.ssh/id_relay.pub --relay-tls insecure
-```
-
-This writes:
-
-```toml
-# slay-relay.toml
-[server]
-allow_insecure_relay = true
-```
-
-```toml
-# slay-agent.toml
-allow_insecure_relay = true
-```
-
-4. Validate both configs:
+5. Validate both configs:
 
 ```bash
 slay config validate relay --config slay-relay.toml
 slay config validate agent --config slay-agent.toml
 ```
 
-5. Start both roles:
+6. Start both roles:
 
 ```bash
 slay relay --config slay-relay.toml
 slay agent --config slay-agent.toml
 ```
 
-## Advanced Token Commands
-
-Generate a token/hash pair without writing config files:
-
-```bash
-slay config token
-```
-
-Hash an existing token, for migration or scripted deployment:
-
-```bash
-slay config hash-token 'at-least-32-random-characters-here'
-```
-
-To avoid putting the token in shell history, pass it through stdin:
-
-```bash
-printf '%s' 'at-least-32-random-characters-here' | slay config hash-token
-```
+The agent connects to the relay over SSH, authenticates as `agent_id`, and registers reverse forwarding for `agent_id:22`. User SSH clients still connect to the relay and request `direct-tcpip` to the agent id through `ProxyJump`.

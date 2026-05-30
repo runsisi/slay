@@ -3,27 +3,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use futures::StreamExt;
+use anyhow::{Context, Result, anyhow};
 use russh::keys::{Certificate, PublicKey, load_secret_key};
 use russh::server::{self, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tokio_yamux::Control;
-use tokio_yamux::config::Config as YamuxConfig;
-use tokio_yamux::session::Session as YamuxSession;
-use tokio_yamux::stream::StreamHandle;
 use tracing::{debug, info, warn};
 
-use crate::agent_protocol::{
-    AgentHello, AgentHelloResponse, OpenStreamRequest, OpenStreamResponse, PROTOCOL_VERSION,
-    read_json_line, write_json_line,
-};
 use crate::config::RelayConfig;
-use crate::tls;
-use crate::token::verify_token;
 
 #[derive(Clone)]
 pub struct RelayState {
@@ -34,24 +22,32 @@ pub struct RelayState {
 
 #[derive(Clone)]
 struct AgentHandle {
-    machine_id: String,
-    machine_alias: String,
     connection_id: u64,
-    control: Control,
+    ssh: server::Handle,
+}
+
+#[derive(Clone, Debug)]
+struct AgentRegistration {
+    agent_id: String,
+    connection_id: u64,
+}
+
+#[derive(Clone, Debug)]
+enum AuthRole {
+    User(String),
+    Agent(String),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RelayRouteError {
-    #[error("unknown machine alias {0}")]
-    UnknownMachine(String),
-    #[error("user {user} is not allowed to access {machine_alias}")]
-    Unauthorized { user: String, machine_alias: String },
-    #[error("machine {0} is offline")]
+    #[error("unknown agent id {0}")]
+    UnknownAgent(String),
+    #[error("user {user} is not allowed to access {agent_id}")]
+    Unauthorized { user: String, agent_id: String },
+    #[error("agent {0} is offline")]
     Offline(String),
-    #[error("agent stream open failed: {0}")]
-    AgentStream(String),
-    #[error("agent rejected stream: {0}")]
-    AgentRejected(String),
+    #[error("agent SSH forwarded channel open failed: {0}")]
+    AgentChannel(String),
 }
 
 impl RelayState {
@@ -63,102 +59,82 @@ impl RelayState {
         }
     }
 
-    pub fn config(&self) -> &RelayConfig {
-        &self.config
-    }
-
-    async fn register_agent(&self, machine_id: &str, control: Control) -> Result<AgentHandle> {
-        let machine = self
-            .config
-            .machine_by_id(machine_id)
-            .with_context(|| format!("unknown machine_id {machine_id}"))?;
+    async fn register_agent(
+        &self,
+        agent_id: &str,
+        ssh: server::Handle,
+    ) -> Result<AgentRegistration> {
+        self.config
+            .agent_by_id(agent_id)
+            .with_context(|| format!("unknown agent_id {agent_id}"))?;
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
-        let handle = AgentHandle {
-            machine_id: machine.machine_id.clone(),
-            machine_alias: machine.machine_alias.clone(),
-            connection_id,
-            control,
-        };
+        let handle = AgentHandle { connection_id, ssh };
         self.online_agents
             .write()
             .await
-            .insert(machine.machine_alias.clone(), handle.clone());
-        Ok(handle)
+            .insert(agent_id.to_string(), handle);
+        Ok(AgentRegistration {
+            agent_id: agent_id.to_string(),
+            connection_id,
+        })
     }
 
-    async fn unregister_agent(&self, handle: &AgentHandle) {
+    async fn unregister_agent(&self, registration: &AgentRegistration) {
         let mut online = self.online_agents.write().await;
         if online
-            .get(&handle.machine_alias)
-            .is_some_and(|current| current.connection_id == handle.connection_id)
+            .get(&registration.agent_id)
+            .is_some_and(|current| current.connection_id == registration.connection_id)
         {
-            online.remove(&handle.machine_alias);
+            online.remove(&registration.agent_id);
         }
     }
 
-    pub async fn open_agent_stream(
+    pub async fn open_agent_channel(
         &self,
         user: &str,
-        machine_alias: &str,
+        agent_id: &str,
         port: u32,
-    ) -> Result<StreamHandle, RelayRouteError> {
+        originator_address: &str,
+        originator_port: u32,
+    ) -> Result<Channel<Msg>, RelayRouteError> {
         if port != 22 {
-            return Err(RelayRouteError::AgentRejected(format!(
+            return Err(RelayRouteError::AgentChannel(format!(
                 "port {port} is not allowed"
             )));
         }
 
-        let machine = self
-            .config
-            .machine_by_alias(machine_alias)
-            .ok_or_else(|| RelayRouteError::UnknownMachine(machine_alias.to_string()))?;
-        if !self.config.user_can_access(user, machine_alias) {
+        self.config
+            .agent_by_id(agent_id)
+            .ok_or_else(|| RelayRouteError::UnknownAgent(agent_id.to_string()))?;
+        if !self.config.user_can_access(user, agent_id) {
             return Err(RelayRouteError::Unauthorized {
                 user: user.to_string(),
-                machine_alias: machine_alias.to_string(),
+                agent_id: agent_id.to_string(),
             });
         }
 
-        let mut control = {
+        let ssh = {
             let online = self.online_agents.read().await;
             online
-                .get(machine_alias)
-                .map(|agent| agent.control.clone())
-                .ok_or_else(|| RelayRouteError::Offline(machine_alias.to_string()))?
+                .get(agent_id)
+                .map(|agent| agent.ssh.clone())
+                .ok_or_else(|| RelayRouteError::Offline(agent_id.to_string()))?
         };
 
-        let mut stream = control
-            .open_stream()
-            .await
-            .map_err(|err| RelayRouteError::AgentStream(err.to_string()))?;
-        let request = OpenStreamRequest {
-            version: PROTOCOL_VERSION,
-            target: machine.target.clone(),
-        };
-        write_json_line(&mut stream, &request)
-            .await
-            .map_err(|err| RelayRouteError::AgentStream(err.to_string()))?;
-        let response: OpenStreamResponse = read_json_line(&mut stream)
-            .await
-            .map_err(|err| RelayRouteError::AgentStream(err.to_string()))?;
-        if !response.ok {
-            return Err(RelayRouteError::AgentRejected(
-                response
-                    .error
-                    .unwrap_or_else(|| "unknown error".to_string()),
-            ));
-        }
-
-        Ok(stream)
+        ssh.channel_open_forwarded_tcpip(
+            agent_id.to_string(),
+            22,
+            originator_address.to_string(),
+            originator_port,
+        )
+        .await
+        .map_err(|err| RelayRouteError::AgentChannel(err.to_string()))
     }
 }
 
 pub async fn run_relay_server(config: RelayConfig) -> Result<()> {
     let state = RelayState::new(config);
-    let ssh = run_ssh_listener(state.clone());
-    let relay_link = run_relay_link_listener(state);
-    tokio::try_join!(ssh, relay_link)?;
-    Ok(())
+    run_ssh_listener(state).await
 }
 
 async fn run_ssh_listener(state: RelayState) -> Result<()> {
@@ -190,132 +166,6 @@ async fn run_ssh_listener(state: RelayState) -> Result<()> {
     Ok(())
 }
 
-async fn run_relay_link_listener(state: RelayState) -> Result<()> {
-    let listener = TcpListener::bind(state.config.server.relay_listen)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to bind relay listener {}",
-                state.config.server.relay_listen
-            )
-        })?;
-    info!(
-        "relay listener bound to {}",
-        state.config.server.relay_listen
-    );
-
-    let tls_acceptor = match (
-        &state.config.server.relay_tls_cert,
-        &state.config.server.relay_tls_key,
-    ) {
-        (Some(cert), Some(key)) => {
-            let config = tls::server_config(cert, key)?;
-            Some(tokio_rustls::TlsAcceptor::from(config))
-        }
-        _ => {
-            warn!("relay listener is running without TLS because allow_insecure_relay is enabled");
-            None
-        }
-    };
-
-    loop {
-        let (socket, peer) = listener.accept().await?;
-        let state = state.clone();
-        let tls_acceptor = tls_acceptor.clone();
-        tokio::spawn(async move {
-            let result = async {
-                if let Some(acceptor) = tls_acceptor {
-                    let stream = acceptor
-                        .accept(socket)
-                        .await
-                        .context("agent TLS handshake failed")?;
-                    handle_agent_connection(state, stream).await
-                } else {
-                    handle_agent_connection(state, socket).await
-                }
-            }
-            .await;
-            if let Err(err) = result {
-                warn!(%peer, error = %err, "agent connection ended with error");
-            }
-        });
-    }
-}
-
-async fn handle_agent_connection<S>(state: RelayState, mut stream: S) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let hello: AgentHello = read_json_line(&mut stream).await?;
-    if hello.version != PROTOCOL_VERSION {
-        write_json_line(
-            &mut stream,
-            &AgentHelloResponse::reject("unsupported protocol version"),
-        )
-        .await?;
-        bail!("agent used unsupported protocol version {}", hello.version);
-    }
-
-    let Some(machine) = state.config.machine_by_id(&hello.machine_id) else {
-        write_json_line(
-            &mut stream,
-            &AgentHelloResponse::reject("unknown machine_id"),
-        )
-        .await?;
-        bail!("unknown machine_id {}", hello.machine_id);
-    };
-    if !verify_token(&hello.agent_token, &machine.agent_token_hash) {
-        write_json_line(
-            &mut stream,
-            &AgentHelloResponse::reject("authentication failed"),
-        )
-        .await?;
-        bail!("agent authentication failed for {}", hello.machine_id);
-    }
-    write_json_line(&mut stream, &AgentHelloResponse::ok()).await?;
-
-    let mut session = YamuxSession::new_client(stream, YamuxConfig::default());
-    let handle = state
-        .register_agent(&hello.machine_id, session.control())
-        .await?;
-    info!(
-        machine_id = %handle.machine_id,
-        machine_alias = %handle.machine_alias,
-        connection_id = handle.connection_id,
-        "agent registered"
-    );
-
-    while let Some(result) = session.next().await {
-        match result {
-            Ok(mut stream) => {
-                warn!(
-                    machine_alias = %handle.machine_alias,
-                    stream_id = stream.id(),
-                    "agent opened an unexpected inbound yamux stream; closing it"
-                );
-                let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
-            }
-            Err(err) => {
-                warn!(
-                    machine_alias = %handle.machine_alias,
-                    error = %err,
-                    "agent yamux session error"
-                );
-                break;
-            }
-        }
-    }
-
-    state.unregister_agent(&handle).await;
-    info!(
-        machine_id = %handle.machine_id,
-        machine_alias = %handle.machine_alias,
-        connection_id = handle.connection_id,
-        "agent unregistered"
-    );
-    Ok(())
-}
-
 #[derive(Clone)]
 struct SshRelayServer {
     state: RelayState,
@@ -327,7 +177,8 @@ impl server::Server for SshRelayServer {
     fn new_client(&mut self, peer_addr: Option<std::net::SocketAddr>) -> Self::Handler {
         SshRelaySession {
             state: self.state.clone(),
-            authenticated_user: None,
+            auth_role: None,
+            agent_registration: None,
             peer_addr,
         }
     }
@@ -339,8 +190,38 @@ impl server::Server for SshRelayServer {
 
 struct SshRelaySession {
     state: RelayState,
-    authenticated_user: Option<String>,
+    auth_role: Option<AuthRole>,
+    agent_registration: Option<AgentRegistration>,
     peer_addr: Option<std::net::SocketAddr>,
+}
+
+impl SshRelaySession {
+    fn auth_role_for_key(&self, user: &str, public_key: &PublicKey) -> Option<AuthRole> {
+        if self.state.config.user_key_allowed(user, public_key) {
+            return Some(AuthRole::User(user.to_string()));
+        }
+        if self.state.config.agent_key_allowed(user, public_key) {
+            return Some(AuthRole::Agent(user.to_string()));
+        }
+        None
+    }
+}
+
+impl Drop for SshRelaySession {
+    fn drop(&mut self) {
+        let Some(registration) = self.agent_registration.take() else {
+            return;
+        };
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            state.unregister_agent(&registration).await;
+            info!(
+                agent_id = %registration.agent_id,
+                connection_id = registration.connection_id,
+                "agent unregistered"
+            );
+        });
+    }
 }
 
 impl server::Handler for SshRelaySession {
@@ -360,7 +241,7 @@ impl server::Handler for SshRelaySession {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<server::Auth, Self::Error> {
-        if self.state.config.user_key_allowed(user, public_key) {
+        if self.auth_role_for_key(user, public_key).is_some() {
             Ok(server::Auth::Accept)
         } else {
             warn!(user, peer = ?self.peer_addr, "unknown public key offered");
@@ -373,9 +254,16 @@ impl server::Handler for SshRelaySession {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<server::Auth, Self::Error> {
-        if self.state.config.user_key_allowed(user, public_key) {
-            self.authenticated_user = Some(user.to_string());
-            info!(user, peer = ?self.peer_addr, "ssh relay user authenticated");
+        if let Some(role) = self.auth_role_for_key(user, public_key) {
+            self.auth_role = Some(role.clone());
+            match role {
+                AuthRole::User(user) => {
+                    info!(user, peer = ?self.peer_addr, "ssh relay user authenticated")
+                }
+                AuthRole::Agent(agent_id) => {
+                    info!(agent_id, peer = ?self.peer_addr, "ssh agent authenticated")
+                }
+            }
             Ok(server::Auth::Accept)
         } else {
             warn!(user, peer = ?self.peer_addr, "public key auth rejected");
@@ -392,13 +280,72 @@ impl server::Handler for SshRelaySession {
         Ok(server::Auth::reject())
     }
 
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Some(AuthRole::Agent(agent_id)) = self.auth_role.as_ref() else {
+            warn!(peer = ?self.peer_addr, "tcpip-forward rejected for non-agent session");
+            return Ok(false);
+        };
+        if address != agent_id || *port != 22 {
+            warn!(
+                agent_id,
+                requested_address = address,
+                requested_port = *port,
+                "agent tcpip-forward rejected"
+            );
+            return Ok(false);
+        }
+        if self.agent_registration.is_some() {
+            warn!(agent_id, "duplicate agent tcpip-forward rejected");
+            return Ok(false);
+        }
+
+        let registration = self
+            .state
+            .register_agent(agent_id, session.handle())
+            .await?;
+        info!(
+            agent_id = %registration.agent_id,
+            connection_id = registration.connection_id,
+            "agent registered SSH reverse forwarding"
+        );
+        self.agent_registration = Some(registration);
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Some(registration) = self.agent_registration.take() else {
+            return Ok(false);
+        };
+        if registration.agent_id != address || port != 22 {
+            self.agent_registration = Some(registration);
+            return Ok(false);
+        }
+        self.state.unregister_agent(&registration).await;
+        info!(
+            agent_id = %registration.agent_id,
+            connection_id = registration.connection_id,
+            "agent cancelled SSH reverse forwarding"
+        );
+        Ok(true)
+    }
+
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
         warn!(
-            user = ?self.authenticated_user,
+            role = ?self.auth_role,
             peer = ?self.peer_addr,
             "shell/session channel rejected"
         );
@@ -414,30 +361,36 @@ impl server::Handler for SshRelaySession {
         originator_port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let Some(user) = self.authenticated_user.as_deref() else {
-            warn!(peer = ?self.peer_addr, "direct-tcpip rejected before auth");
+        let Some(AuthRole::User(user)) = self.auth_role.as_ref() else {
+            warn!(peer = ?self.peer_addr, "direct-tcpip rejected before user auth");
             return Ok(false);
         };
 
         debug!(
             user,
-            machine_alias = host_to_connect,
+            agent_id = host_to_connect,
             port = port_to_connect,
             originator_address,
             originator_port,
             "direct-tcpip requested"
         );
 
-        let stream = match self
+        let agent_channel = match self
             .state
-            .open_agent_stream(user, host_to_connect, port_to_connect)
+            .open_agent_channel(
+                user,
+                host_to_connect,
+                port_to_connect,
+                originator_address,
+                originator_port,
+            )
             .await
         {
-            Ok(stream) => stream,
+            Ok(channel) => channel,
             Err(err) => {
                 warn!(
                     user,
-                    machine_alias = host_to_connect,
+                    agent_id = host_to_connect,
                     port = port_to_connect,
                     error = %err,
                     "direct-tcpip rejected"
@@ -446,10 +399,10 @@ impl server::Handler for SshRelaySession {
             }
         };
 
-        let machine_alias = host_to_connect.to_string();
+        let agent_id = host_to_connect.to_string();
         tokio::spawn(async move {
-            if let Err(err) = relay_channel_to_agent(channel, stream).await {
-                debug!(machine_alias, error = %err, "relay stream ended");
+            if let Err(err) = relay_user_channel_to_agent(channel, agent_channel).await {
+                debug!(agent_id, error = %err, "relay stream ended");
             }
         });
         Ok(true)
@@ -508,12 +461,13 @@ impl server::Handler for SshRelaySession {
     }
 }
 
-async fn relay_channel_to_agent(
-    channel: Channel<Msg>,
-    mut agent_stream: StreamHandle,
+async fn relay_user_channel_to_agent(
+    user_channel: Channel<Msg>,
+    agent_channel: Channel<Msg>,
 ) -> Result<()> {
-    let mut ssh_stream = channel.into_stream();
-    tokio::io::copy_bidirectional(&mut ssh_stream, &mut agent_stream)
+    let mut user_stream = user_channel.into_stream();
+    let mut agent_stream = agent_channel.into_stream();
+    tokio::io::copy_bidirectional(&mut user_stream, &mut agent_stream)
         .await
         .map(|_| ())
         .map_err(|err| anyhow!("stream copy failed: {err}"))
@@ -522,102 +476,56 @@ async fn relay_channel_to_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_protocol::{OpenStreamRequest, OpenStreamResponse};
-    use crate::token::hash_token;
     use russh::keys::{Algorithm, PrivateKey};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
-    use tokio::sync::oneshot;
+
+    fn public_key_line() -> String {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        key.public_key().to_openssh().unwrap()
+    }
 
     fn relay_config() -> RelayConfig {
-        let user_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let token_hash = hash_token("01234567890123456789012345678901").unwrap();
+        let user_key = public_key_line();
+        let agent_key_a = public_key_line();
+        let agent_key_b = public_key_line();
         let raw = format!(
             r#"
 [server]
 ssh_listen = "127.0.0.1:2222"
-relay_listen = "127.0.0.1:4443"
 ssh_host_key = "/tmp/slay-test-host-key"
-allow_insecure_relay = true
 
 [users.alice]
-public_keys = ["{}"]
-allowed_machines = ["alice-home-linux"]
+authorized_keys = ["{user_key}"]
+allowed_agents = ["alice-home-linux"]
 
-[machines.alice_home]
-machine_id = "mch_01"
-machine_alias = "alice-home-linux"
-display_name = "Alice Home"
-agent_token_hash = "{}"
+[agents.alice-home-linux]
+agent_authorized_keys = ["{agent_key_a}"]
 target = "127.0.0.1:22"
-"#,
-            user_key.public_key().to_openssh().unwrap(),
-            token_hash
+
+[agents.bob-home-linux]
+agent_authorized_keys = ["{agent_key_b}"]
+target = "127.0.0.1:22"
+"#
         );
         RelayConfig::from_toml_str(&raw).unwrap()
     }
 
     #[tokio::test]
-    async fn opens_agent_stream_after_acl_check() {
-        let state = RelayState::new(relay_config());
-        let (relay_io, agent_io) = duplex(64 * 1024);
-        let mut relay_session = YamuxSession::new_client(relay_io, YamuxConfig::default());
-        let handle = state
-            .register_agent("mch_01", relay_session.control())
-            .await
-            .unwrap();
-
-        let relay_driver = tokio::spawn(async move {
-            while let Some(result) = relay_session.next().await {
-                result.unwrap();
-            }
-        });
-
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let agent = tokio::spawn(async move {
-            let mut agent_session = YamuxSession::new_server(agent_io, YamuxConfig::default());
-            let mut stop_rx = Box::pin(stop_rx);
-
-            loop {
-                tokio::select! {
-                    result = agent_session.next() => {
-                        let mut stream = result.unwrap().unwrap();
-                        tokio::spawn(async move {
-                            let request: OpenStreamRequest = read_json_line(&mut stream).await.unwrap();
-                            assert_eq!(request.target, "127.0.0.1:22");
-                            write_json_line(&mut stream, &OpenStreamResponse::ok()).await.unwrap();
-
-                            let mut buf = [0_u8; 4];
-                            stream.read_exact(&mut buf).await.unwrap();
-                            stream.write_all(&buf).await.unwrap();
-                        });
-                    }
-                    _ = &mut stop_rx => break,
-                }
-            }
-        });
-
-        let mut stream = state
-            .open_agent_stream("alice", "alice-home-linux", 22)
-            .await
-            .unwrap();
-        stream.write_all(b"ping").await.unwrap();
-        let mut echoed = [0_u8; 4];
-        stream.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"ping");
-
-        let _ = stop_tx.send(());
-        state.unregister_agent(&handle).await;
-        relay_driver.abort();
-        agent.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn denies_unauthorized_agent_stream() {
+    async fn denies_unauthorized_agent_channel() {
         let state = RelayState::new(relay_config());
         let err = state
-            .open_agent_stream("bob", "alice-home-linux", 22)
+            .open_agent_channel("alice", "bob-home-linux", 22, "127.0.0.1", 5555)
             .await
             .unwrap_err();
         assert!(matches!(err, RelayRouteError::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn authorized_agent_must_be_online() {
+        let state = RelayState::new(relay_config());
+        let err = state
+            .open_agent_channel("alice", "alice-home-linux", 22, "127.0.0.1", 5555)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelayRouteError::Offline(_)));
     }
 }
