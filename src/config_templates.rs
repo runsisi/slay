@@ -1,3 +1,6 @@
+pub const DEFAULT_RELAY_TLS_CERT_PATH: &str = "/etc/slay/relay.crt";
+pub const DEFAULT_RELAY_TLS_KEY_PATH: &str = "/etc/slay/relay.key";
+
 pub const RELAY_CONFIG_TEMPLATE: &str = r#"# slay relay config
 
 [server]
@@ -125,11 +128,11 @@ fn render_relay_tls_config(input: &PairTemplateInput<'_>) -> String {
     let cert = input
         .relay_tls_cert
         .map(toml_string)
-        .unwrap_or_else(|| toml_string("/etc/slay/relay.crt"));
+        .unwrap_or_else(|| toml_string(DEFAULT_RELAY_TLS_CERT_PATH));
     let key = input
         .relay_tls_key
         .map(toml_string)
-        .unwrap_or_else(|| toml_string("/etc/slay/relay.key"));
+        .unwrap_or_else(|| toml_string(DEFAULT_RELAY_TLS_KEY_PATH));
     format!("relay_tls_cert = {cert}\nrelay_tls_key = {key}")
 }
 

@@ -12,8 +12,8 @@ use rcgen::{
 use slay::agent::run_agent;
 use slay::config::{AgentConfig, RelayConfig, parse_public_key};
 use slay::config_templates::{
-    AGENT_CONFIG_TEMPLATE, PairTemplateInput, RELAY_CONFIG_TEMPLATE, render_agent_config,
-    render_relay_config,
+    AGENT_CONFIG_TEMPLATE, DEFAULT_RELAY_TLS_CERT_PATH, DEFAULT_RELAY_TLS_KEY_PATH,
+    PairTemplateInput, RELAY_CONFIG_TEMPLATE, render_agent_config, render_relay_config,
 };
 use slay::relay::run_relay_server;
 use slay::token::{generate_machine_id, generate_token, hash_token};
@@ -360,8 +360,8 @@ fn generate_private_ca_tls_config(
     write_generated_file(&relay_key_path, &material.relay_key_pem, true)?;
 
     Ok(PairTlsConfig {
-        relay_tls_cert: Some(path_to_config_string(&relay_cert_path)?),
-        relay_tls_key: Some(path_to_config_string(&relay_key_path)?),
+        relay_tls_cert: Some(DEFAULT_RELAY_TLS_CERT_PATH.to_string()),
+        relay_tls_key: Some(DEFAULT_RELAY_TLS_KEY_PATH.to_string()),
         relay_allow_insecure: false,
         relay_ca_cert: Some(path_to_config_string(&ca_cert_path)?),
         agent_allow_insecure: false,
@@ -524,4 +524,37 @@ fn read_token(token: Option<String>) -> Result<String> {
     let mut input = String::new();
     io::Read::read_to_string(&mut io::stdin(), &mut input).context("failed to read token")?;
     Ok(input.trim_end_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_tls_dir() -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("slay-main-test-{}-{suffix}", std::process::id()))
+    }
+
+    #[test]
+    fn private_ca_init_writes_relay_runtime_tls_paths() {
+        let tls_dir = temp_tls_dir();
+        let config = generate_private_ca_tls_config(&tls_dir, "relay.example.com", false).unwrap();
+
+        assert_eq!(
+            config.relay_tls_cert.as_deref(),
+            Some(DEFAULT_RELAY_TLS_CERT_PATH)
+        );
+        assert_eq!(
+            config.relay_tls_key.as_deref(),
+            Some(DEFAULT_RELAY_TLS_KEY_PATH)
+        );
+        assert!(tls_dir.join("relay.crt").exists());
+        assert!(tls_dir.join("relay.key").exists());
+
+        fs::remove_dir_all(&tls_dir).unwrap();
+    }
 }

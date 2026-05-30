@@ -31,7 +31,7 @@ slay config init \
   --tls-dir ./slay-tls
 ```
 
-By default this uses `--relay-tls private-ca`, creates a private CA plus a relay server certificate in `--tls-dir`, and writes the matching TLS paths into both configs.
+By default this uses `--relay-tls private-ca`, creates a private CA plus a relay server certificate in `--tls-dir`, writes `relay_ca_cert` from that directory into the agent config, and writes relay runtime TLS paths such as `/etc/slay/relay.crt` and `/etc/slay/relay.key` into the relay config.
 
 Set the machine alias and display name during paired generation:
 
@@ -139,7 +139,7 @@ slay config init \
 2. Edit `slay-relay.toml`:
 
 - Set the relay SSH host key path.
-- Keep or deploy the generated `relay_tls_cert` and `relay_tls_key` paths.
+- Deploy `relay.crt` and `relay.key` to the configured `relay_tls_cert` and `relay_tls_key` paths, for example under `/etc/slay`.
 - Confirm the relay user public key.
 - Keep `machine_alias` unique.
 
