@@ -66,7 +66,7 @@ MVP 固定采用以下决策：
 - `slay agent` 到 relay 的认证使用每台机器独立的高熵 token。
 - relay 只保存 agent token hash，不保存 token 明文。
 - agent 到 relay 的公网长连接默认强制 TLS；本地开发必须通过显式 insecure 配置才可以临时关闭 TLS。
-- `slay config init pair` 默认生成 agent 链路使用的私有 CA 和 relay server 证书，也允许选择外部证书或本地 insecure 模式。
+- `slay config init` 默认生成 agent 链路使用的私有 CA 和 relay server 证书，也允许选择外部证书或本地 insecure 模式。
 - 每台 PC 有不可变内部 `machine_id` 和可读 `machine_alias`。
 - 手机 SSH 客户端使用 `machine_alias` 作为 Jump Host 目标 host。
 - MVP 只支持转发到 PC 本机 sshd，即 `127.0.0.1:22`。
@@ -154,28 +154,28 @@ agent_token = "高熵随机字符串"
 
 ## Agent TLS 证书
 
-MVP 中 agent 到 relay 的长连接默认使用 TLS。为了降低首次部署门槛，`slay config init pair` 默认使用 `private-ca` 模式生成一套只服务于 agent 链路的私有 CA 和 relay server 证书：
+MVP 中 agent 到 relay 的长连接默认使用 TLS。为了降低首次部署门槛，`slay config init` 默认使用 `private-ca` 模式生成一套只服务于 agent 链路的私有 CA 和 relay server 证书：
 
 ```text
-agent_ca.crt
-agent_ca.key
-agent_relay.crt
-agent_relay.key
+agent-ca.crt
+agent-ca.key
+agent-relay.crt
+agent-relay.key
 ```
 
 配置关系：
 
 ```text
 relay:
-  agent_tls_cert = agent_relay.crt
-  agent_tls_key  = agent_relay.key
+  agent_tls_cert = agent-relay.crt
+  agent_tls_key  = agent-relay.key
 
 agent:
   relay_name     = relay.example.com
-  relay_ca_cert  = agent_ca.crt
+  relay_ca_cert  = agent-ca.crt
 ```
 
-`agent_relay.crt` 的 SAN 必须匹配 agent 连接时使用的 `relay_name`。`agent_ca.key` 和 `agent_relay.key` 是敏感文件；`agent_ca.key` 只用于签发证书，不应复制到 agent 机器。
+`slay config init` 必须显式传入 `--relay-addr`，避免把占位地址写入 agent 配置和 TLS 证书。`--relay-public-key` 可以省略；省略时 relay 配置会包含占位公钥，替换后再执行 relay 配置校验。`--relay-name` 可选；未传时从 `--relay-addr` 推导。`agent-relay.crt` 的 SAN 必须匹配 agent 连接时使用的 `relay_name`。`agent-ca.key` 和 `agent-relay.key` 是敏感文件；`agent-ca.key` 只用于签发证书，不应复制到 agent 机器。
 
 证书模式：
 
@@ -313,8 +313,8 @@ relay 配置示例：
 ssh_listen = "0.0.0.0:2222"
 agent_listen = "0.0.0.0:443"
 ssh_host_key = "/etc/slay/relay_host_ed25519"
-agent_tls_cert = "/etc/slay/agent_relay.crt"
-agent_tls_key = "/etc/slay/agent_relay.key"
+agent_tls_cert = "/etc/slay/agent-relay.crt"
+agent_tls_key = "/etc/slay/agent-relay.key"
 # local development only:
 # allow_insecure_agent_link = true
 
@@ -348,7 +348,7 @@ agent 配置示例：
 relay_addr = "relay.example.com:443"
 relay_name = "relay.example.com"
 # optional when the relay certificate is signed by a public CA
-relay_ca_cert = "/etc/slay/agent_relay_ca.crt"
+relay_ca_cert = "/etc/slay/agent-ca.crt"
 # local development only:
 # allow_insecure_relay_link = true
 machine_id = "mch_01HX9V4V7P6R4M8YJ7A9S0K2QW"
@@ -377,9 +377,9 @@ reconnect_secs = 5
 - `slay` 二进制。
 - `slay relay` 子命令。
 - `slay agent` 子命令。
-- `slay config init pair` 一次生成匹配的 relay/agent 配置，并填入共享的 `machine_id`、agent token、token hash 和 agent TLS 配置。
-- `slay config init pair --agent-tls private-ca|external|insecure` 选择 agent 链路 TLS bootstrap 模式。
-- `slay config init relay|agent` 分别生成单侧配置模板。
+- `slay config init` 一次生成匹配的 relay/agent 配置，并填入共享的 `machine_id`、agent token、token hash 和 agent TLS 配置。
+- `slay config init --agent-tls private-ca|external|insecure` 选择 agent 链路 TLS bootstrap 模式。
+- `slay config gen relay|agent` 分别生成单侧配置。
 - `slay config validate` 校验 relay/agent 配置。
 - `slay config token` 生成新的 agent token 和 relay 侧 hash。
 - `slay config hash-token` 生成 relay 侧保存的 agent token hash。
@@ -413,8 +413,8 @@ reconnect_secs = 5
 - relay 不支持密码登录，只允许 SSH 公钥认证。
 - 公网部署时 agent 到 relay 的长连接必须启用 TLS。
 - 明文 agent 链路只能通过显式 insecure 配置用于本地开发。
-- 私有 CA 模式生成的 `agent_ca.key` 和 `agent_relay.key` 必须使用私有文件权限保存。
-- `agent_ca.key` 不得复制到 agent 机器。
+- 私有 CA 模式生成的 `agent-ca.key` 和 `agent-relay.key` 必须使用私有文件权限保存。
+- `agent-ca.key` 不得复制到 agent 机器。
 - 每台 machine 使用独立 agent token。
 - relay 只保存 agent token hash，不保存 token 明文。
 - relay 启动前必须校验 agent token hash 格式。

@@ -46,34 +46,13 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    #[command(about = "Create a config template")]
-    Init {
-        #[command(subcommand)]
-        target: ConfigInitTarget,
-    },
-    #[command(about = "Validate a config file")]
-    Validate {
-        #[command(subcommand)]
-        target: ConfigValidateTarget,
-    },
-    #[command(about = "Generate a new agent token and relay-side hash")]
-    Token,
-    #[command(about = "Hash an agent token for relay config")]
-    HashToken {
-        #[arg(help = "Token to hash. If omitted, token is read from stdin.")]
-        token: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ConfigInitTarget {
     #[command(about = "Create matching relay and agent configs")]
-    Pair {
+    Init {
         #[arg(long, default_value = "slay-relay.toml")]
         relay_output: PathBuf,
         #[arg(long, default_value = "slay-agent.toml")]
         agent_output: PathBuf,
-        #[arg(long, default_value = "relay.example.com:443")]
+        #[arg(long)]
         relay_addr: String,
         #[arg(long)]
         relay_name: Option<String>,
@@ -92,14 +71,35 @@ enum ConfigInitTarget {
         #[arg(short, long)]
         force: bool,
     },
-    #[command(about = "Create a relay config template")]
+    #[command(about = "Validate a config file")]
+    Validate {
+        #[command(subcommand)]
+        target: ConfigValidateTarget,
+    },
+    #[command(about = "Generate a single-side config")]
+    Gen {
+        #[command(subcommand)]
+        target: ConfigGenTarget,
+    },
+    #[command(about = "Generate a new agent token and relay-side hash")]
+    Token,
+    #[command(about = "Hash an agent token for relay config")]
+    HashToken {
+        #[arg(help = "Token to hash. If omitted, token is read from stdin.")]
+        token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigGenTarget {
+    #[command(about = "Generate a relay config")]
     Relay {
         #[arg(short, long, default_value = "slay-relay.toml")]
         output: PathBuf,
         #[arg(short, long)]
         force: bool,
     },
-    #[command(about = "Create an agent config template")]
+    #[command(about = "Generate an agent config")]
     Agent {
         #[arg(short, long, default_value = "slay-agent.toml")]
         output: PathBuf,
@@ -146,36 +146,36 @@ async fn main() -> Result<()> {
 
 fn handle_config_command(command: ConfigCommand) -> Result<()> {
     match command {
-        ConfigCommand::Init { target } => match target {
-            ConfigInitTarget::Pair {
-                relay_output,
-                agent_output,
-                relay_addr,
-                relay_name,
-                machine_alias,
-                display_name,
-                relay_user,
-                relay_public_key,
-                agent_tls,
-                tls_dir,
-                force,
-            } => write_pair_templates(PairInitOptions {
-                relay_output: &relay_output,
-                agent_output: &agent_output,
-                relay_addr: &relay_addr,
-                relay_name: relay_name.as_deref(),
-                machine_alias: &machine_alias,
-                display_name: &display_name,
-                relay_user: &relay_user,
-                relay_public_key: relay_public_key.as_deref(),
-                agent_tls,
-                tls_dir: &tls_dir,
-                force,
-            }),
-            ConfigInitTarget::Relay { output, force } => {
+        ConfigCommand::Init {
+            relay_output,
+            agent_output,
+            relay_addr,
+            relay_name,
+            machine_alias,
+            display_name,
+            relay_user,
+            relay_public_key,
+            agent_tls,
+            tls_dir,
+            force,
+        } => write_pair_templates(PairInitOptions {
+            relay_output: &relay_output,
+            agent_output: &agent_output,
+            relay_addr: &relay_addr,
+            relay_name: relay_name.as_deref(),
+            machine_alias: &machine_alias,
+            display_name: &display_name,
+            relay_user: &relay_user,
+            relay_public_key: relay_public_key.as_deref(),
+            agent_tls,
+            tls_dir: &tls_dir,
+            force,
+        }),
+        ConfigCommand::Gen { target } => match target {
+            ConfigGenTarget::Relay { output, force } => {
                 write_template(&output, RELAY_CONFIG_TEMPLATE, force)
             }
-            ConfigInitTarget::Agent { output, force } => {
+            ConfigGenTarget::Agent { output, force } => {
                 write_template(&output, AGENT_CONFIG_TEMPLATE, force)
             }
         },
@@ -223,7 +223,7 @@ fn write_template(output: &Path, content: &str, force: bool) -> Result<()> {
     }
 
     fs::write(output, content)
-        .with_context(|| format!("failed to write config template {}", output.display()))?;
+        .with_context(|| format!("failed to write config file {}", output.display()))?;
     println!("wrote {}", output.display());
     Ok(())
 }
@@ -265,14 +265,7 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
     let agent_token_hash = hash_token(&agent_token)?;
     let machine_id = generate_machine_id();
     let relay_public_key = match options.relay_public_key {
-        Some(path) => {
-            let key = fs::read_to_string(path)
-                .with_context(|| format!("failed to read relay public key {}", path.display()))?;
-            let key = key.trim();
-            parse_public_key(key)
-                .with_context(|| format!("invalid relay public key {}", path.display()))?;
-            key.to_string()
-        }
+        Some(path) => read_relay_public_key(path)?,
         None => "ssh-ed25519 REPLACE_WITH_RELAY_USER_PUBLIC_KEY alice@example".to_string(),
     };
     let input = PairTemplateInput {
@@ -295,6 +288,15 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
     write_template(options.relay_output, &render_relay_config(&input), true)?;
     write_template(options.agent_output, &render_agent_config(&input), true)?;
     Ok(())
+}
+
+fn read_relay_public_key(path: &Path) -> Result<String> {
+    let key = fs::read_to_string(path)
+        .with_context(|| format!("failed to read relay public key {}", path.display()))?;
+    let key = key.trim();
+    parse_public_key(key)
+        .with_context(|| format!("invalid relay public key {}", path.display()))?;
+    Ok(key.to_string())
 }
 
 struct PairTlsConfig {
@@ -336,10 +338,10 @@ fn generate_private_ca_tls_config(
     force: bool,
 ) -> Result<PairTlsConfig> {
     let tls_dir = absolute_path(tls_dir)?;
-    let ca_cert_path = tls_dir.join("agent_ca.crt");
-    let ca_key_path = tls_dir.join("agent_ca.key");
-    let relay_cert_path = tls_dir.join("agent_relay.crt");
-    let relay_key_path = tls_dir.join("agent_relay.key");
+    let ca_cert_path = tls_dir.join("agent-ca.crt");
+    let ca_key_path = tls_dir.join("agent-ca.key");
+    let relay_cert_path = tls_dir.join("agent-relay.crt");
+    let relay_key_path = tls_dir.join("agent-relay.key");
     for path in [
         &ca_cert_path,
         &ca_key_path,

@@ -4,8 +4,8 @@ pub const RELAY_CONFIG_TEMPLATE: &str = r#"# slay relay config
 ssh_listen = "0.0.0.0:2222"
 agent_listen = "0.0.0.0:443"
 ssh_host_key = "/etc/slay/relay_host_ed25519"
-agent_tls_cert = "/etc/slay/agent_relay.crt"
-agent_tls_key = "/etc/slay/agent_relay.key"
+agent_tls_cert = "/etc/slay/agent-relay.crt"
+agent_tls_key = "/etc/slay/agent-relay.key"
 # For local development only:
 # allow_insecure_agent_link = true
 
@@ -32,7 +32,7 @@ pub const AGENT_CONFIG_TEMPLATE: &str = r#"# slay agent config
 relay_addr = "relay.example.com:443"
 relay_name = "relay.example.com"
 # For public CA certificates, relay_ca_cert can be omitted.
-relay_ca_cert = "/etc/slay/agent_relay_ca.crt"
+relay_ca_cert = "/etc/slay/agent-ca.crt"
 # For local development only:
 # allow_insecure_relay_link = true
 
@@ -125,11 +125,11 @@ fn render_relay_tls_config(input: &PairTemplateInput<'_>) -> String {
     let cert = input
         .relay_agent_tls_cert
         .map(toml_string)
-        .unwrap_or_else(|| toml_string("/etc/slay/agent_relay.crt"));
+        .unwrap_or_else(|| toml_string("/etc/slay/agent-relay.crt"));
     let key = input
         .relay_agent_tls_key
         .map(toml_string)
-        .unwrap_or_else(|| toml_string("/etc/slay/agent_relay.key"));
+        .unwrap_or_else(|| toml_string("/etc/slay/agent-relay.key"));
     format!("agent_tls_cert = {cert}\nagent_tls_key = {key}")
 }
 
@@ -171,10 +171,10 @@ mod tests {
             relay_public_key: "ssh-ed25519 AAAA alice@example",
             relay_addr: "relay.example.com:443",
             relay_name: "relay.example.com",
-            relay_agent_tls_cert: Some("/tmp/slay-tls/agent_relay.crt"),
-            relay_agent_tls_key: Some("/tmp/slay-tls/agent_relay.key"),
+            relay_agent_tls_cert: Some("/tmp/slay-tls/agent-relay.crt"),
+            relay_agent_tls_key: Some("/tmp/slay-tls/agent-relay.key"),
             allow_insecure_agent_link: false,
-            agent_relay_ca_cert: Some("/tmp/slay-tls/agent_ca.crt"),
+            agent_relay_ca_cert: Some("/tmp/slay-tls/agent-ca.crt"),
             allow_insecure_relay_link: false,
             machine_id: "mch_01HX9V4V7P6R4M8YJ7A9S0K2QW",
             machine_alias: "alice-home-linux",
