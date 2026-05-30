@@ -65,7 +65,7 @@ MVP 固定采用以下决策：
 - relay 用户认证只支持 SSH 公钥认证，不支持密码登录。
 - `slay agent` 到 relay 的认证使用每台机器独立的高熵 token。
 - relay 只保存 agent token hash，不保存 token 明文。
-- agent 到 relay 的公网长连接必须支持 TLS；本地开发可以临时关闭 TLS。
+- agent 到 relay 的公网长连接默认强制 TLS；本地开发必须通过显式 insecure 配置才可以临时关闭 TLS。
 - 每台 PC 有不可变内部 `machine_id` 和可读 `machine_alias`。
 - 手机 SSH 客户端使用 `machine_alias` 作为 Jump Host 目标 host。
 - MVP 只支持转发到 PC 本机 sshd，即 `127.0.0.1:22`。
@@ -146,6 +146,7 @@ agent_token = "高熵随机字符串"
 - token 必须由高质量随机数生成。
 - 每台 machine 使用独立 token。
 - relay 配置中只保存 token hash。
+- `agent_token_hash` 必须是合法的 Argon2 PHC hash 字符串。
 - 日志不能输出 token 明文。
 - token 泄漏后必须可以单独轮换，不影响其他 machine。
 
@@ -279,6 +280,8 @@ agent_listen = "0.0.0.0:443"
 ssh_host_key = "/etc/slay/relay_host_ed25519"
 agent_tls_cert = "/etc/slay/agent_relay.crt"
 agent_tls_key = "/etc/slay/agent_relay.key"
+# local development only:
+# allow_insecure_agent_link = true
 
 [users.alice]
 public_keys = [
@@ -293,14 +296,14 @@ allowed_machines = [
 machine_id = "mch_01HX9V4V7P6R4M8YJ7A9S0K2QW"
 machine_alias = "alice-home-linux"
 display_name = "Alice Home Linux"
-agent_token_hash = "argon2id:..."
+agent_token_hash = "$argon2id$..."
 target = "127.0.0.1:22"
 
 [machines.alice_office]
 machine_id = "mch_01HY3GEXXQ0G3MJ4XK2PG8R7AA"
 machine_alias = "alice-office-linux"
 display_name = "Alice Office Linux"
-agent_token_hash = "argon2id:..."
+agent_token_hash = "$argon2id$..."
 target = "127.0.0.1:22"
 ```
 
@@ -309,10 +312,14 @@ agent 配置示例：
 ```toml
 relay_addr = "relay.example.com:443"
 relay_name = "relay.example.com"
+# optional when the relay certificate is signed by a public CA
 relay_ca_cert = "/etc/slay/agent_relay_ca.crt"
+# local development only:
+# allow_insecure_relay_link = true
 machine_id = "mch_01HX9V4V7P6R4M8YJ7A9S0K2QW"
 agent_token = "高熵随机字符串"
 target = "127.0.0.1:22"
+reconnect_secs = 5
 ```
 
 ## Rust 技术选型
@@ -334,8 +341,10 @@ target = "127.0.0.1:22"
 - `slay` 二进制。
 - `slay relay` 子命令。
 - `slay agent` 子命令。
-- `slay config init` 生成 relay/agent 配置模板。
+- `slay config init pair` 一次生成匹配的 relay/agent 配置，并填入共享的 `machine_id`、agent token 和 token hash。
+- `slay config init relay|agent` 分别生成单侧配置模板。
 - `slay config validate` 校验 relay/agent 配置。
+- `slay config token` 生成新的 agent token 和 relay 侧 hash。
 - `slay config hash-token` 生成 relay 侧保存的 agent token hash。
 - relay 用户 SSH 公钥认证。
 - `slay agent` token 认证。
@@ -366,8 +375,10 @@ target = "127.0.0.1:22"
 - relay 不保存 PC 登录私钥或 PC 登录密码。
 - relay 不支持密码登录，只允许 SSH 公钥认证。
 - 公网部署时 agent 到 relay 的长连接必须启用 TLS。
+- 明文 agent 链路只能通过显式 insecure 配置用于本地开发。
 - 每台 machine 使用独立 agent token。
 - relay 只保存 agent token hash，不保存 token 明文。
+- relay 启动前必须校验 agent token hash 格式。
 - 每个 relay 用户配置可访问的 machine allowlist。
 - machine agent 只能注册配置中允许的 `machine_id`。
 - `machine_alias` 必须全局唯一。

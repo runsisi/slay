@@ -214,7 +214,7 @@ async fn run_agent_listener(state: RelayState) -> Result<()> {
         }
         _ => {
             warn!(
-                "agent listener is running without TLS; configure agent_tls_cert and agent_tls_key before exposing it"
+                "agent listener is running without TLS because allow_insecure_agent_link is enabled"
             );
             None
         }
@@ -539,6 +539,7 @@ mod tests {
 ssh_listen = "127.0.0.1:2222"
 agent_listen = "127.0.0.1:4443"
 ssh_host_key = "/tmp/slay-test-host-key"
+allow_insecure_agent_link = true
 
 [users.alice]
 public_keys = ["{}"]

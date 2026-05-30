@@ -32,7 +32,10 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
     let tcp = TcpStream::connect(&config.relay_addr)
         .await
         .with_context(|| format!("failed to connect relay {}", config.relay_addr))?;
-    let stream = if config.relay_ca_cert.is_some() {
+    let stream = if config.allow_insecure_relay_link {
+        warn!("agent is connecting without TLS because allow_insecure_relay_link is enabled");
+        EitherStream::Plain(tcp)
+    } else {
         let client_config = tls::client_config(config.relay_ca_cert.as_deref())?;
         let connector = TlsConnector::from(client_config);
         let server_name = ServerName::try_from(config.relay_server_name()?)
@@ -43,9 +46,6 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
                 .await
                 .context("agent TLS handshake failed")?,
         ))
-    } else {
-        warn!("agent is connecting without TLS because relay_ca_cert is not configured");
-        EitherStream::Plain(tcp)
     };
 
     run_authenticated_session(config, stream).await

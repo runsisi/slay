@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use russh::keys::{HashAlg, PublicKey};
 use serde::Deserialize;
 
+use crate::token::validate_token_hash;
+
 #[derive(Debug, Deserialize)]
 pub struct RelayConfigFile {
     pub server: RelayServerConfig,
@@ -24,6 +26,8 @@ pub struct RelayServerConfig {
     pub ssh_host_key: PathBuf,
     pub agent_tls_cert: Option<PathBuf>,
     pub agent_tls_key: Option<PathBuf>,
+    #[serde(default)]
+    pub allow_insecure_agent_link: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +62,7 @@ pub struct RuntimeRelayServerConfig {
     pub ssh_host_key: PathBuf,
     pub agent_tls_cert: Option<PathBuf>,
     pub agent_tls_key: Option<PathBuf>,
+    pub allow_insecure_agent_link: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +76,8 @@ pub struct AgentConfig {
     pub relay_addr: String,
     pub relay_name: Option<String>,
     pub relay_ca_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub allow_insecure_relay_link: bool,
     pub machine_id: String,
     pub agent_token: String,
     pub target: String,
@@ -108,12 +115,18 @@ impl RelayConfig {
         if !tls_pair_complete {
             bail!("agent_tls_cert and agent_tls_key must be configured together");
         }
+        if file.server.agent_tls_cert.is_none() && !file.server.allow_insecure_agent_link {
+            bail!(
+                "agent TLS is required; configure agent_tls_cert/agent_tls_key or set allow_insecure_agent_link = true for local development"
+            );
+        }
 
         let mut machines_by_id = HashMap::new();
         let mut machines_by_alias = HashMap::new();
         for (entry_name, machine) in file.machines {
             validate_identifier("machine_id", &machine.machine_id)?;
             validate_identifier("machine_alias", &machine.machine_alias)?;
+            validate_token_hash(&machine.agent_token_hash)?;
             if machine.target != "127.0.0.1:22" {
                 bail!("machine {entry_name} target must be 127.0.0.1:22 for the SSH-only MVP");
             }
@@ -168,6 +181,7 @@ impl RelayConfig {
                 ssh_host_key: file.server.ssh_host_key,
                 agent_tls_cert: file.server.agent_tls_cert,
                 agent_tls_key: file.server.agent_tls_key,
+                allow_insecure_agent_link: file.server.allow_insecure_agent_link,
             },
             users: Arc::new(users),
             machines_by_id: Arc::new(machines_by_id),
@@ -227,6 +241,9 @@ impl AgentConfig {
         if self.agent_token.len() < 32 {
             bail!("agent_token must be at least 32 characters");
         }
+        if self.reconnect_secs == 0 {
+            bail!("reconnect_secs must be at least 1");
+        }
         if self.target != "127.0.0.1:22" {
             bail!("agent target must be 127.0.0.1:22 for the SSH-only MVP");
         }
@@ -284,6 +301,7 @@ mod tests {
 ssh_listen = "127.0.0.1:2222"
 agent_listen = "127.0.0.1:4443"
 ssh_host_key = "/tmp/slay-test-host-key"
+allow_insecure_agent_link = true
 
 [users.alice]
 public_keys = ["{}"]
@@ -336,6 +354,37 @@ target = "127.0.0.1:22"
             .replace("target = \"127.0.0.1:22\"", "target = \"127.0.0.1:8080\"");
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
         assert!(err.to_string().contains("127.0.0.1:22"));
+    }
+
+    #[test]
+    fn rejects_relay_config_without_tls_or_insecure_flag() {
+        let raw = base_config("alice-home-linux").replace("allow_insecure_agent_link = true\n", "");
+        let err = RelayConfig::from_toml_str(&raw).unwrap_err();
+        assert!(err.to_string().contains("agent TLS is required"));
+    }
+
+    #[test]
+    fn rejects_invalid_agent_token_hash() {
+        let raw = base_config("alice-home-linux").replace(
+            "agent_token_hash = \"",
+            "agent_token_hash = \"not-a-valid-hash",
+        );
+        let err = RelayConfig::from_toml_str(&raw).unwrap_err();
+        assert!(err.to_string().contains("invalid agent_token_hash"));
+    }
+
+    #[test]
+    fn rejects_zero_reconnect_delay() {
+        let raw = r#"
+relay_addr = "relay.example.com:443"
+machine_id = "mch_01"
+agent_token = "01234567890123456789012345678901"
+target = "127.0.0.1:22"
+reconnect_secs = 0
+"#;
+        let config: AgentConfig = toml::from_str(raw).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("reconnect_secs"));
     }
 
     #[test]

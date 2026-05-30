@@ -1,12 +1,18 @@
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use slay::agent::run_agent;
-use slay::config::{AgentConfig, RelayConfig};
-use slay::config_templates::{AGENT_CONFIG_TEMPLATE, RELAY_CONFIG_TEMPLATE};
+use slay::config::{AgentConfig, RelayConfig, parse_public_key};
+use slay::config_templates::{
+    AGENT_CONFIG_TEMPLATE, PairTemplateInput, RELAY_CONFIG_TEMPLATE, render_agent_config,
+    render_relay_config,
+};
 use slay::relay::run_relay_server;
-use slay::token::hash_token;
+use slay::token::{generate_machine_id, generate_token, hash_token};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "SSH relay for machines behind NAT")]
@@ -46,6 +52,8 @@ enum ConfigCommand {
         #[command(subcommand)]
         target: ConfigValidateTarget,
     },
+    #[command(about = "Generate a new agent token and relay-side hash")]
+    Token,
     #[command(about = "Hash an agent token for relay config")]
     HashToken {
         #[arg(help = "Token to hash. If omitted, token is read from stdin.")]
@@ -55,6 +63,23 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigInitTarget {
+    #[command(about = "Create matching relay and agent configs")]
+    Pair {
+        #[arg(long, default_value = "slay-relay.toml")]
+        relay_output: PathBuf,
+        #[arg(long, default_value = "slay-agent.toml")]
+        agent_output: PathBuf,
+        #[arg(long, default_value = "home-linux")]
+        machine_alias: String,
+        #[arg(long, default_value = "Home Linux")]
+        display_name: String,
+        #[arg(long, default_value = "alice")]
+        relay_user: String,
+        #[arg(long)]
+        relay_public_key: Option<PathBuf>,
+        #[arg(short, long)]
+        force: bool,
+    },
     #[command(about = "Create a relay config template")]
     Relay {
         #[arg(short, long, default_value = "slay-relay.toml")]
@@ -103,6 +128,23 @@ async fn main() -> Result<()> {
 fn handle_config_command(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Init { target } => match target {
+            ConfigInitTarget::Pair {
+                relay_output,
+                agent_output,
+                machine_alias,
+                display_name,
+                relay_user,
+                relay_public_key,
+                force,
+            } => write_pair_templates(
+                &relay_output,
+                &agent_output,
+                &machine_alias,
+                &display_name,
+                &relay_user,
+                relay_public_key.as_deref(),
+                force,
+            ),
             ConfigInitTarget::Relay { output, force } => {
                 write_template(&output, RELAY_CONFIG_TEMPLATE, force)
             }
@@ -122,6 +164,13 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
                 Ok(())
             }
         },
+        ConfigCommand::Token => {
+            let token = generate_token();
+            let hash = hash_token(&token)?;
+            println!("agent_token = \"{token}\"");
+            println!("agent_token_hash = \"{hash}\"");
+            Ok(())
+        }
         ConfigCommand::HashToken { token } => {
             let token = read_token(token)?;
             if token.len() < 32 {
@@ -133,7 +182,7 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
     }
 }
 
-fn write_template(output: &PathBuf, content: &str, force: bool) -> Result<()> {
+fn write_template(output: &Path, content: &str, force: bool) -> Result<()> {
     if output.as_os_str() == "-" {
         print!("{content}");
         return Ok(());
@@ -149,6 +198,88 @@ fn write_template(output: &PathBuf, content: &str, force: bool) -> Result<()> {
     fs::write(output, content)
         .with_context(|| format!("failed to write config template {}", output.display()))?;
     println!("wrote {}", output.display());
+    Ok(())
+}
+
+fn write_pair_templates(
+    relay_output: &Path,
+    agent_output: &Path,
+    machine_alias: &str,
+    display_name: &str,
+    relay_user: &str,
+    relay_public_key: Option<&Path>,
+    force: bool,
+) -> Result<()> {
+    if relay_output == agent_output {
+        bail!("relay_output and agent_output must be different paths");
+    }
+    validate_machine_alias(machine_alias)?;
+    validate_config_table_key("relay_user", relay_user)?;
+    ensure_can_write(relay_output, force)?;
+    ensure_can_write(agent_output, force)?;
+
+    let agent_token = generate_token();
+    let agent_token_hash = hash_token(&agent_token)?;
+    let machine_id = generate_machine_id();
+    let relay_public_key = match relay_public_key {
+        Some(path) => {
+            let key = fs::read_to_string(path)
+                .with_context(|| format!("failed to read relay public key {}", path.display()))?;
+            let key = key.trim();
+            parse_public_key(key)
+                .with_context(|| format!("invalid relay public key {}", path.display()))?;
+            key.to_string()
+        }
+        None => "ssh-ed25519 REPLACE_WITH_RELAY_USER_PUBLIC_KEY alice@example".to_string(),
+    };
+    let input = PairTemplateInput {
+        relay_user,
+        relay_public_key: &relay_public_key,
+        machine_id: &machine_id,
+        machine_alias,
+        display_name,
+        agent_token: &agent_token,
+        agent_token_hash: &agent_token_hash,
+    };
+
+    write_template(relay_output, &render_relay_config(&input), true)?;
+    write_template(agent_output, &render_agent_config(&input), true)?;
+    Ok(())
+}
+
+fn validate_machine_alias(machine_alias: &str) -> Result<()> {
+    if machine_alias.is_empty() {
+        bail!("machine_alias cannot be empty");
+    }
+    let valid = machine_alias
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    if !valid {
+        bail!("machine_alias may only contain ASCII letters, digits, '_', '-' and '.'");
+    }
+    Ok(())
+}
+
+fn validate_config_table_key(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    let valid = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+    if !valid {
+        bail!("{label} may only contain ASCII letters, digits, '_' and '-'");
+    }
+    Ok(())
+}
+
+fn ensure_can_write(output: &Path, force: bool) -> Result<()> {
+    if output.as_os_str() != "-" && output.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to overwrite it",
+            output.display()
+        );
+    }
     Ok(())
 }
 
