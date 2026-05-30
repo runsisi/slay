@@ -62,8 +62,10 @@ enum ConfigCommand {
         display_name: String,
         #[arg(long, default_value = "alice")]
         relay_user: String,
-        #[arg(long)]
-        relay_public_key: Option<PathBuf>,
+        #[arg(long = "relay-authorized-key", value_name = "PATH")]
+        relay_authorized_keys: Vec<PathBuf>,
+        #[arg(long = "relay-authorized-keys", value_name = "PATH")]
+        relay_authorized_key_files: Vec<PathBuf>,
         #[arg(long, value_enum, default_value_t = RelayTlsMode::PrivateCa)]
         relay_tls: RelayTlsMode,
         #[arg(long, default_value = "slay-tls")]
@@ -154,7 +156,8 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
             machine_alias,
             display_name,
             relay_user,
-            relay_public_key,
+            relay_authorized_keys,
+            relay_authorized_key_files,
             relay_tls,
             tls_dir,
             force,
@@ -166,7 +169,8 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
             machine_alias: &machine_alias,
             display_name: &display_name,
             relay_user: &relay_user,
-            relay_public_key: relay_public_key.as_deref(),
+            relay_authorized_keys: &relay_authorized_keys,
+            relay_authorized_key_files: &relay_authorized_key_files,
             relay_tls,
             tls_dir: &tls_dir,
             force,
@@ -236,7 +240,8 @@ struct PairInitOptions<'a> {
     machine_alias: &'a str,
     display_name: &'a str,
     relay_user: &'a str,
-    relay_public_key: Option<&'a Path>,
+    relay_authorized_keys: &'a [PathBuf],
+    relay_authorized_key_files: &'a [PathBuf],
     relay_tls: RelayTlsMode,
     tls_dir: &'a Path,
     force: bool,
@@ -264,13 +269,17 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
     let agent_token = generate_token();
     let agent_token_hash = hash_token(&agent_token)?;
     let machine_id = generate_machine_id();
-    let relay_public_key = match options.relay_public_key {
-        Some(path) => read_relay_public_key(path)?,
-        None => "ssh-ed25519 REPLACE_WITH_RELAY_USER_PUBLIC_KEY alice@example".to_string(),
-    };
+    let mut relay_public_keys = read_relay_authorized_public_keys(
+        options.relay_authorized_keys,
+        options.relay_authorized_key_files,
+    )?;
+    if relay_public_keys.is_empty() {
+        relay_public_keys
+            .push("ssh-ed25519 REPLACE_WITH_RELAY_USER_PUBLIC_KEY alice@example".to_string());
+    }
     let input = PairTemplateInput {
         relay_user: options.relay_user,
-        relay_public_key: &relay_public_key,
+        relay_public_keys: &relay_public_keys,
         relay_addr: options.relay_addr,
         relay_name: &relay_name,
         relay_tls_cert: tls_config.relay_tls_cert.as_deref(),
@@ -290,13 +299,106 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
     Ok(())
 }
 
-fn read_relay_public_key(path: &Path) -> Result<String> {
-    let key = fs::read_to_string(path)
-        .with_context(|| format!("failed to read relay public key {}", path.display()))?;
-    let key = key.trim();
-    parse_public_key(key)
-        .with_context(|| format!("invalid relay public key {}", path.display()))?;
-    Ok(key.to_string())
+fn read_relay_authorized_public_keys(
+    authorized_key_paths: &[PathBuf],
+    authorized_keys_paths: &[PathBuf],
+) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for path in authorized_key_paths {
+        push_unique_authorized_key(&mut keys, read_relay_authorized_key(path)?);
+    }
+    for path in authorized_keys_paths {
+        for key in read_relay_authorized_keys_file(path)? {
+            push_unique_authorized_key(&mut keys, key);
+        }
+    }
+    Ok(keys)
+}
+
+fn read_relay_authorized_key(path: &Path) -> Result<String> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read relay authorized key {}", path.display()))?;
+    let keys = parse_authorized_key_lines(&raw, path)?;
+    match keys.as_slice() {
+        [key] => Ok(key.clone()),
+        [] => bail!(
+            "relay authorized key {} does not contain a public key",
+            path.display()
+        ),
+        _ => bail!(
+            "relay authorized key {} contains multiple public keys; use --relay-authorized-keys for authorized_keys files",
+            path.display()
+        ),
+    }
+}
+
+fn read_relay_authorized_keys_file(path: &Path) -> Result<Vec<String>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read relay authorized keys {}", path.display()))?;
+    let keys = parse_authorized_key_lines(&raw, path)?;
+    if keys.is_empty() {
+        bail!(
+            "relay authorized keys {} does not contain any public keys",
+            path.display()
+        );
+    }
+    Ok(keys)
+}
+
+fn parse_authorized_key_lines(raw: &str, path: &Path) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for (index, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let key = extract_public_key_from_authorized_key_line(line).with_context(|| {
+            format!(
+                "invalid relay authorized key {}:{}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        parse_public_key(&key).with_context(|| {
+            format!(
+                "invalid relay authorized key {}:{}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+fn extract_public_key_from_authorized_key_line(line: &str) -> Result<String> {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    let Some(key_type_index) = parts.iter().position(|part| is_ssh_public_key_type(part)) else {
+        bail!("missing SSH public key type");
+    };
+    if key_type_index + 1 >= parts.len() {
+        bail!("missing SSH public key body");
+    }
+    Ok(parts[key_type_index..].join(" "))
+}
+
+fn is_ssh_public_key_type(token: &str) -> bool {
+    matches!(
+        token,
+        "ssh-ed25519"
+            | "ssh-rsa"
+            | "rsa-sha2-256"
+            | "rsa-sha2-512"
+            | "sk-ssh-ed25519@openssh.com"
+            | "sk-ecdsa-sha2-nistp256@openssh.com"
+    ) || token.starts_with("ecdsa-sha2-")
+}
+
+fn push_unique_authorized_key(keys: &mut Vec<String>, key: String) {
+    if !keys.iter().any(|existing| existing == &key) {
+        keys.push(key);
+    }
 }
 
 struct PairTlsConfig {
@@ -529,6 +631,7 @@ fn read_token(token: Option<String>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russh::keys::{Algorithm, PrivateKey};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_tls_dir() -> PathBuf {
@@ -537,6 +640,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!("slay-main-test-{}-{suffix}", std::process::id()))
+    }
+
+    fn public_key_line(comment: &str) -> String {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        format!("{} {comment}", key.public_key().to_openssh().unwrap())
     }
 
     #[test]
@@ -556,5 +664,15 @@ mod tests {
         assert!(tls_dir.join("relay.key").exists());
 
         fs::remove_dir_all(&tls_dir).unwrap();
+    }
+
+    #[test]
+    fn parses_authorized_keys_file_style_lines() {
+        let key_a = public_key_line("laptop");
+        let key_b = public_key_line("phone");
+        let raw = format!("# relay user keys\n{key_a}\nno-pty {key_b}\n\n");
+        let parsed = parse_authorized_key_lines(&raw, Path::new("authorized_keys")).unwrap();
+
+        assert_eq!(parsed, vec![key_a, key_b]);
     }
 }

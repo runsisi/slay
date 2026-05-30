@@ -48,7 +48,7 @@ reconnect_secs = 5
 
 pub struct PairTemplateInput<'a> {
     pub relay_user: &'a str,
-    pub relay_public_key: &'a str,
+    pub relay_public_keys: &'a [String],
     pub relay_addr: &'a str,
     pub relay_name: &'a str,
     pub relay_tls_cert: Option<&'a str>,
@@ -65,7 +65,7 @@ pub struct PairTemplateInput<'a> {
 
 pub fn render_relay_config(input: &PairTemplateInput<'_>) -> String {
     let relay_user = input.relay_user;
-    let relay_public_key = toml_string(input.relay_public_key);
+    let relay_public_keys = render_toml_array_items(input.relay_public_keys);
     let tls_config = render_relay_tls_config(input);
     let machine_id = toml_string(input.machine_id);
     let machine_alias = toml_string(input.machine_alias);
@@ -83,7 +83,7 @@ ssh_host_key = "/etc/slay/relay_host_ed25519"
 [users.{relay_user}]
 # Replace with the public key used to authenticate to the relay.
 public_keys = [
-  {relay_public_key}
+{relay_public_keys}
 ]
 allowed_machines = [
   {machine_alias}
@@ -149,6 +149,14 @@ fn render_agent_relay_tls_config(input: &PairTemplateInput<'_>) -> String {
         })
 }
 
+fn render_toml_array_items(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("  {}", toml_string(value)))
+        .collect::<Vec<_>>()
+        .join(",\n")
+}
+
 fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
@@ -169,9 +177,10 @@ mod tests {
 
     #[test]
     fn rendered_pair_templates_are_toml() {
+        let relay_public_keys = vec!["ssh-ed25519 AAAA alice@example".to_string()];
         let input = PairTemplateInput {
             relay_user: "alice",
-            relay_public_key: "ssh-ed25519 AAAA alice@example",
+            relay_public_keys: &relay_public_keys,
             relay_addr: "relay.example.com:443",
             relay_name: "relay.example.com",
             relay_tls_cert: Some("/tmp/slay-tls/relay.crt"),
@@ -191,9 +200,10 @@ mod tests {
 
     #[test]
     fn rendered_insecure_pair_templates_are_toml() {
+        let relay_public_keys = vec!["ssh-ed25519 AAAA alice@example".to_string()];
         let input = PairTemplateInput {
             relay_user: "alice",
-            relay_public_key: "ssh-ed25519 AAAA alice@example",
+            relay_public_keys: &relay_public_keys,
             relay_addr: "127.0.0.1:4443",
             relay_name: "127.0.0.1",
             relay_tls_cert: None,
@@ -209,5 +219,33 @@ mod tests {
         };
         toml::from_str::<toml::Value>(&render_relay_config(&input)).unwrap();
         toml::from_str::<toml::Value>(&render_agent_config(&input)).unwrap();
+    }
+
+    #[test]
+    fn rendered_pair_template_supports_multiple_relay_public_keys() {
+        let relay_public_keys = vec![
+            "ssh-ed25519 AAAA alice@example".to_string(),
+            "ssh-ed25519 BBBB phone@example".to_string(),
+        ];
+        let input = PairTemplateInput {
+            relay_user: "alice",
+            relay_public_keys: &relay_public_keys,
+            relay_addr: "relay.example.com:443",
+            relay_name: "relay.example.com",
+            relay_tls_cert: Some("/etc/slay/relay.crt"),
+            relay_tls_key: Some("/etc/slay/relay.key"),
+            relay_allow_insecure: false,
+            relay_ca_cert: Some("/tmp/slay-tls/relay-ca.crt"),
+            agent_allow_insecure: false,
+            machine_id: "mch_01HX9V4V7P6R4M8YJ7A9S0K2QW",
+            machine_alias: "alice-home-linux",
+            display_name: "Alice Home Linux",
+            agent_token: "abcdefghijklmnopqrstuvwxyz0123456789",
+            agent_token_hash: "$argon2id$v=19$m=19456,t=2,p=1$salt$hash",
+        };
+        let raw = render_relay_config(&input);
+        let parsed = toml::from_str::<toml::Value>(&raw).unwrap();
+        let public_keys = parsed["users"]["alice"]["public_keys"].as_array().unwrap();
+        assert_eq!(public_keys.len(), 2);
     }
 }

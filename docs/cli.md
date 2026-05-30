@@ -27,7 +27,7 @@ slay config init \
   --relay-addr relay.example.com:443 \
   --relay-name relay.example.com \
   --relay-user alice \
-  --relay-public-key ~/.ssh/id_relay.pub \
+  --relay-authorized-key ~/.ssh/id_relay.pub \
   --tls-dir ./slay-tls
 ```
 
@@ -38,24 +38,41 @@ Set the machine alias and display name during paired generation:
 ```bash
 slay config init \
   --relay-addr relay.example.com:443 \
-  --relay-public-key ~/.ssh/id_relay.pub \
+  --relay-authorized-key ~/.ssh/id_relay.pub \
   --machine-alias alice-home-linux \
   --display-name "Alice Home Linux"
 ```
 
-`--relay-addr` is required because it is written into the agent config and used for generated TLS certificates. `--relay-public-key` is optional; if omitted, replace the placeholder public key before validating or running the relay.
+`--relay-addr` is required because it is written into the agent config and used for generated TLS certificates. `--relay-authorized-key` is optional; if omitted, replace the placeholder public key before validating or running the relay.
+
+Authorize multiple SSH client keys for the relay user:
+
+```bash
+slay config init \
+  --relay-addr relay.example.com:443 \
+  --relay-authorized-key ~/.ssh/id_laptop.pub \
+  --relay-authorized-key ~/.ssh/id_phone.pub
+```
+
+Or read an OpenSSH-style `authorized_keys` file:
+
+```bash
+slay config init \
+  --relay-addr relay.example.com:443 \
+  --relay-authorized-keys ~/.ssh/authorized_keys
+```
 
 Select relay-link TLS mode:
 
 ```bash
 # Default: generate a private CA and relay certificate.
-slay config init --relay-addr relay.example.com:443 --relay-public-key ~/.ssh/id_relay.pub --relay-tls private-ca --tls-dir ./slay-tls
+slay config init --relay-addr relay.example.com:443 --relay-authorized-key ~/.ssh/id_relay.pub --relay-tls private-ca --tls-dir ./slay-tls
 
 # Use externally managed TLS files, such as a public CA certificate.
-slay config init --relay-addr relay.example.com:443 --relay-public-key ~/.ssh/id_relay.pub --relay-tls external
+slay config init --relay-addr relay.example.com:443 --relay-authorized-key ~/.ssh/id_relay.pub --relay-tls external
 
 # Local development only.
-slay config init --relay-addr 127.0.0.1:4443 --relay-public-key ~/.ssh/id_relay.pub --relay-tls insecure
+slay config init --relay-addr 127.0.0.1:4443 --relay-authorized-key ~/.ssh/id_relay.pub --relay-tls insecure
 ```
 
 `private-ca` creates:
@@ -129,7 +146,7 @@ slay config init \
   --relay-addr relay.example.com:443 \
   --relay-name relay.example.com \
   --relay-user alice \
-  --relay-public-key ~/.ssh/id_relay.pub \
+  --relay-authorized-key ~/.ssh/id_relay.pub \
   --relay-tls private-ca \
   --tls-dir ./slay-tls \
   --machine-alias alice-home-linux \
@@ -153,7 +170,7 @@ slay config init \
 For local development only, generate plain relay links explicitly:
 
 ```bash
-slay config init --relay-addr 127.0.0.1:4443 --relay-public-key ~/.ssh/id_relay.pub --relay-tls insecure
+slay config init --relay-addr 127.0.0.1:4443 --relay-authorized-key ~/.ssh/id_relay.pub --relay-tls insecure
 ```
 
 This writes:

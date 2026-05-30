@@ -175,7 +175,7 @@ agent:
   relay_ca_cert  = relay-ca.crt
 ```
 
-`slay config init` 必须显式传入 `--relay-addr`，避免把占位地址写入 agent 配置和 TLS 证书。`--relay-public-key` 可以省略；省略时 relay 配置会包含占位公钥，替换后再执行 relay 配置校验。`--relay-name` 可选；未传时从 `--relay-addr` 推导。`relay.crt` 的 SAN 必须匹配 agent 连接时使用的 `relay_name`。生成的 `relay.crt` 和 `relay.key` 可以先落在 `--tls-dir`，但 relay 配置中的 `relay_tls_cert` 和 `relay_tls_key` 应指向部署后的运行时路径，例如 `/etc/slay/relay.crt` 和 `/etc/slay/relay.key`。`relay-ca.key` 和 `relay.key` 是敏感文件；`relay-ca.key` 只用于签发证书，不应复制到 agent 机器。
+`slay config init` 必须显式传入 `--relay-addr`，避免把占位地址写入 agent 配置和 TLS 证书。`--relay-authorized-key` 可以重复传入单个公钥文件，`--relay-authorized-keys` 可以传入 OpenSSH 风格的 authorized_keys 文件；两者都省略时 relay 配置会包含占位公钥，替换后再执行 relay 配置校验。`--relay-name` 可选；未传时从 `--relay-addr` 推导。`relay.crt` 的 SAN 必须匹配 agent 连接时使用的 `relay_name`。生成的 `relay.crt` 和 `relay.key` 可以先落在 `--tls-dir`，但 relay 配置中的 `relay_tls_cert` 和 `relay_tls_key` 应指向部署后的运行时路径，例如 `/etc/slay/relay.crt` 和 `/etc/slay/relay.key`。`relay-ca.key` 和 `relay.key` 是敏感文件；`relay-ca.key` 只用于签发证书，不应复制到 agent 机器。
 
 证书模式：
 
