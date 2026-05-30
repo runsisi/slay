@@ -156,8 +156,8 @@ impl RelayState {
 pub async fn run_relay_server(config: RelayConfig) -> Result<()> {
     let state = RelayState::new(config);
     let ssh = run_ssh_listener(state.clone());
-    let agent = run_agent_listener(state);
-    tokio::try_join!(ssh, agent)?;
+    let relay_link = run_relay_link_listener(state);
+    tokio::try_join!(ssh, relay_link)?;
     Ok(())
 }
 
@@ -190,32 +190,30 @@ async fn run_ssh_listener(state: RelayState) -> Result<()> {
     Ok(())
 }
 
-async fn run_agent_listener(state: RelayState) -> Result<()> {
-    let listener = TcpListener::bind(state.config.server.agent_listen)
+async fn run_relay_link_listener(state: RelayState) -> Result<()> {
+    let listener = TcpListener::bind(state.config.server.relay_listen)
         .await
         .with_context(|| {
             format!(
-                "failed to bind agent listener {}",
-                state.config.server.agent_listen
+                "failed to bind relay listener {}",
+                state.config.server.relay_listen
             )
         })?;
     info!(
-        "agent listener bound to {}",
-        state.config.server.agent_listen
+        "relay listener bound to {}",
+        state.config.server.relay_listen
     );
 
     let tls_acceptor = match (
-        &state.config.server.agent_tls_cert,
-        &state.config.server.agent_tls_key,
+        &state.config.server.relay_tls_cert,
+        &state.config.server.relay_tls_key,
     ) {
         (Some(cert), Some(key)) => {
             let config = tls::server_config(cert, key)?;
             Some(tokio_rustls::TlsAcceptor::from(config))
         }
         _ => {
-            warn!(
-                "agent listener is running without TLS because allow_insecure_agent_link is enabled"
-            );
+            warn!("relay listener is running without TLS because allow_insecure_relay is enabled");
             None
         }
     };
@@ -537,9 +535,9 @@ mod tests {
             r#"
 [server]
 ssh_listen = "127.0.0.1:2222"
-agent_listen = "127.0.0.1:4443"
+relay_listen = "127.0.0.1:4443"
 ssh_host_key = "/tmp/slay-test-host-key"
-allow_insecure_agent_link = true
+allow_insecure_relay = true
 
 [users.alice]
 public_keys = ["{}"]

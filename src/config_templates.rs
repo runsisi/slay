@@ -2,12 +2,12 @@ pub const RELAY_CONFIG_TEMPLATE: &str = r#"# slay relay config
 
 [server]
 ssh_listen = "0.0.0.0:2222"
-agent_listen = "0.0.0.0:443"
+relay_listen = "0.0.0.0:443"
 ssh_host_key = "/etc/slay/relay_host_ed25519"
-agent_tls_cert = "/etc/slay/agent-relay.crt"
-agent_tls_key = "/etc/slay/agent-relay.key"
+relay_tls_cert = "/etc/slay/relay.crt"
+relay_tls_key = "/etc/slay/relay.key"
 # For local development only:
-# allow_insecure_agent_link = true
+# allow_insecure_relay = true
 
 [users.alice]
 # Replace with the public key used to authenticate to the relay.
@@ -32,9 +32,9 @@ pub const AGENT_CONFIG_TEMPLATE: &str = r#"# slay agent config
 relay_addr = "relay.example.com:443"
 relay_name = "relay.example.com"
 # For public CA certificates, relay_ca_cert can be omitted.
-relay_ca_cert = "/etc/slay/agent-ca.crt"
+relay_ca_cert = "/etc/slay/relay-ca.crt"
 # For local development only:
-# allow_insecure_relay_link = true
+# allow_insecure_relay = true
 
 machine_id = "mch_01HX9V4V7P6R4M8YJ7A9S0K2QW"
 # Use the token that was hashed into relay config.
@@ -48,11 +48,11 @@ pub struct PairTemplateInput<'a> {
     pub relay_public_key: &'a str,
     pub relay_addr: &'a str,
     pub relay_name: &'a str,
-    pub relay_agent_tls_cert: Option<&'a str>,
-    pub relay_agent_tls_key: Option<&'a str>,
-    pub allow_insecure_agent_link: bool,
-    pub agent_relay_ca_cert: Option<&'a str>,
-    pub allow_insecure_relay_link: bool,
+    pub relay_tls_cert: Option<&'a str>,
+    pub relay_tls_key: Option<&'a str>,
+    pub relay_allow_insecure: bool,
+    pub relay_ca_cert: Option<&'a str>,
+    pub agent_allow_insecure: bool,
     pub machine_id: &'a str,
     pub machine_alias: &'a str,
     pub display_name: &'a str,
@@ -73,7 +73,7 @@ pub fn render_relay_config(input: &PairTemplateInput<'_>) -> String {
 
 [server]
 ssh_listen = "0.0.0.0:2222"
-agent_listen = "0.0.0.0:443"
+relay_listen = "0.0.0.0:443"
 ssh_host_key = "/etc/slay/relay_host_ed25519"
 {tls_config}
 
@@ -99,7 +99,7 @@ target = "127.0.0.1:22"
 pub fn render_agent_config(input: &PairTemplateInput<'_>) -> String {
     let relay_addr = toml_string(input.relay_addr);
     let relay_name = toml_string(input.relay_name);
-    let tls_config = render_agent_tls_config(input);
+    let tls_config = render_agent_relay_tls_config(input);
     let machine_id = toml_string(input.machine_id);
     let agent_token = toml_string(input.agent_token);
     format!(
@@ -118,28 +118,28 @@ reconnect_secs = 5
 }
 
 fn render_relay_tls_config(input: &PairTemplateInput<'_>) -> String {
-    if input.allow_insecure_agent_link {
-        return "allow_insecure_agent_link = true".to_string();
+    if input.relay_allow_insecure {
+        return "allow_insecure_relay = true".to_string();
     }
 
     let cert = input
-        .relay_agent_tls_cert
+        .relay_tls_cert
         .map(toml_string)
-        .unwrap_or_else(|| toml_string("/etc/slay/agent-relay.crt"));
+        .unwrap_or_else(|| toml_string("/etc/slay/relay.crt"));
     let key = input
-        .relay_agent_tls_key
+        .relay_tls_key
         .map(toml_string)
-        .unwrap_or_else(|| toml_string("/etc/slay/agent-relay.key"));
-    format!("agent_tls_cert = {cert}\nagent_tls_key = {key}")
+        .unwrap_or_else(|| toml_string("/etc/slay/relay.key"));
+    format!("relay_tls_cert = {cert}\nrelay_tls_key = {key}")
 }
 
-fn render_agent_tls_config(input: &PairTemplateInput<'_>) -> String {
-    if input.allow_insecure_relay_link {
-        return "allow_insecure_relay_link = true".to_string();
+fn render_agent_relay_tls_config(input: &PairTemplateInput<'_>) -> String {
+    if input.agent_allow_insecure {
+        return "allow_insecure_relay = true".to_string();
     }
 
     input
-        .agent_relay_ca_cert
+        .relay_ca_cert
         .map(|path| format!("relay_ca_cert = {}", toml_string(path)))
         .unwrap_or_else(|| {
             "# relay_ca_cert can be omitted when the relay certificate uses a public CA".to_string()
@@ -171,11 +171,11 @@ mod tests {
             relay_public_key: "ssh-ed25519 AAAA alice@example",
             relay_addr: "relay.example.com:443",
             relay_name: "relay.example.com",
-            relay_agent_tls_cert: Some("/tmp/slay-tls/agent-relay.crt"),
-            relay_agent_tls_key: Some("/tmp/slay-tls/agent-relay.key"),
-            allow_insecure_agent_link: false,
-            agent_relay_ca_cert: Some("/tmp/slay-tls/agent-ca.crt"),
-            allow_insecure_relay_link: false,
+            relay_tls_cert: Some("/tmp/slay-tls/relay.crt"),
+            relay_tls_key: Some("/tmp/slay-tls/relay.key"),
+            relay_allow_insecure: false,
+            relay_ca_cert: Some("/tmp/slay-tls/relay-ca.crt"),
+            agent_allow_insecure: false,
             machine_id: "mch_01HX9V4V7P6R4M8YJ7A9S0K2QW",
             machine_alias: "alice-home-linux",
             display_name: "Alice \"Home\" Linux",
@@ -193,11 +193,11 @@ mod tests {
             relay_public_key: "ssh-ed25519 AAAA alice@example",
             relay_addr: "127.0.0.1:4443",
             relay_name: "127.0.0.1",
-            relay_agent_tls_cert: None,
-            relay_agent_tls_key: None,
-            allow_insecure_agent_link: true,
-            agent_relay_ca_cert: None,
-            allow_insecure_relay_link: true,
+            relay_tls_cert: None,
+            relay_tls_key: None,
+            relay_allow_insecure: true,
+            relay_ca_cert: None,
+            agent_allow_insecure: true,
             machine_id: "mch_01HX9V4V7P6R4M8YJ7A9S0K2QW",
             machine_alias: "alice-home-linux",
             display_name: "Alice Home Linux",

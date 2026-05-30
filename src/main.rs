@@ -64,8 +64,8 @@ enum ConfigCommand {
         relay_user: String,
         #[arg(long)]
         relay_public_key: Option<PathBuf>,
-        #[arg(long, value_enum, default_value_t = AgentTlsMode::PrivateCa)]
-        agent_tls: AgentTlsMode,
+        #[arg(long, value_enum, default_value_t = RelayTlsMode::PrivateCa)]
+        relay_tls: RelayTlsMode,
         #[arg(long, default_value = "slay-tls")]
         tls_dir: PathBuf,
         #[arg(short, long)]
@@ -109,7 +109,7 @@ enum ConfigGenTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum AgentTlsMode {
+enum RelayTlsMode {
     PrivateCa,
     External,
     Insecure,
@@ -155,7 +155,7 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
             display_name,
             relay_user,
             relay_public_key,
-            agent_tls,
+            relay_tls,
             tls_dir,
             force,
         } => write_pair_templates(PairInitOptions {
@@ -167,7 +167,7 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
             display_name: &display_name,
             relay_user: &relay_user,
             relay_public_key: relay_public_key.as_deref(),
-            agent_tls,
+            relay_tls,
             tls_dir: &tls_dir,
             force,
         }),
@@ -237,7 +237,7 @@ struct PairInitOptions<'a> {
     display_name: &'a str,
     relay_user: &'a str,
     relay_public_key: Option<&'a Path>,
-    agent_tls: AgentTlsMode,
+    relay_tls: RelayTlsMode,
     tls_dir: &'a Path,
     force: bool,
 }
@@ -255,7 +255,7 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
     ensure_can_write(options.relay_output, options.force)?;
     ensure_can_write(options.agent_output, options.force)?;
     let tls_config = prepare_pair_tls_config(
-        options.agent_tls,
+        options.relay_tls,
         options.tls_dir,
         &relay_name,
         options.force,
@@ -273,11 +273,11 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
         relay_public_key: &relay_public_key,
         relay_addr: options.relay_addr,
         relay_name: &relay_name,
-        relay_agent_tls_cert: tls_config.relay_agent_tls_cert.as_deref(),
-        relay_agent_tls_key: tls_config.relay_agent_tls_key.as_deref(),
-        allow_insecure_agent_link: tls_config.allow_insecure_agent_link,
-        agent_relay_ca_cert: tls_config.agent_relay_ca_cert.as_deref(),
-        allow_insecure_relay_link: tls_config.allow_insecure_relay_link,
+        relay_tls_cert: tls_config.relay_tls_cert.as_deref(),
+        relay_tls_key: tls_config.relay_tls_key.as_deref(),
+        relay_allow_insecure: tls_config.relay_allow_insecure,
+        relay_ca_cert: tls_config.relay_ca_cert.as_deref(),
+        agent_allow_insecure: tls_config.agent_allow_insecure,
         machine_id: &machine_id,
         machine_alias: options.machine_alias,
         display_name: options.display_name,
@@ -300,34 +300,34 @@ fn read_relay_public_key(path: &Path) -> Result<String> {
 }
 
 struct PairTlsConfig {
-    relay_agent_tls_cert: Option<String>,
-    relay_agent_tls_key: Option<String>,
-    allow_insecure_agent_link: bool,
-    agent_relay_ca_cert: Option<String>,
-    allow_insecure_relay_link: bool,
+    relay_tls_cert: Option<String>,
+    relay_tls_key: Option<String>,
+    relay_allow_insecure: bool,
+    relay_ca_cert: Option<String>,
+    agent_allow_insecure: bool,
 }
 
 fn prepare_pair_tls_config(
-    mode: AgentTlsMode,
+    mode: RelayTlsMode,
     tls_dir: &Path,
     relay_name: &str,
     force: bool,
 ) -> Result<PairTlsConfig> {
     match mode {
-        AgentTlsMode::PrivateCa => generate_private_ca_tls_config(tls_dir, relay_name, force),
-        AgentTlsMode::External => Ok(PairTlsConfig {
-            relay_agent_tls_cert: None,
-            relay_agent_tls_key: None,
-            allow_insecure_agent_link: false,
-            agent_relay_ca_cert: None,
-            allow_insecure_relay_link: false,
+        RelayTlsMode::PrivateCa => generate_private_ca_tls_config(tls_dir, relay_name, force),
+        RelayTlsMode::External => Ok(PairTlsConfig {
+            relay_tls_cert: None,
+            relay_tls_key: None,
+            relay_allow_insecure: false,
+            relay_ca_cert: None,
+            agent_allow_insecure: false,
         }),
-        AgentTlsMode::Insecure => Ok(PairTlsConfig {
-            relay_agent_tls_cert: None,
-            relay_agent_tls_key: None,
-            allow_insecure_agent_link: true,
-            agent_relay_ca_cert: None,
-            allow_insecure_relay_link: true,
+        RelayTlsMode::Insecure => Ok(PairTlsConfig {
+            relay_tls_cert: None,
+            relay_tls_key: None,
+            relay_allow_insecure: true,
+            relay_ca_cert: None,
+            agent_allow_insecure: true,
         }),
     }
 }
@@ -338,10 +338,10 @@ fn generate_private_ca_tls_config(
     force: bool,
 ) -> Result<PairTlsConfig> {
     let tls_dir = absolute_path(tls_dir)?;
-    let ca_cert_path = tls_dir.join("agent-ca.crt");
-    let ca_key_path = tls_dir.join("agent-ca.key");
-    let relay_cert_path = tls_dir.join("agent-relay.crt");
-    let relay_key_path = tls_dir.join("agent-relay.key");
+    let ca_cert_path = tls_dir.join("relay-ca.crt");
+    let ca_key_path = tls_dir.join("relay-ca.key");
+    let relay_cert_path = tls_dir.join("relay.crt");
+    let relay_key_path = tls_dir.join("relay.key");
     for path in [
         &ca_cert_path,
         &ca_key_path,
@@ -360,11 +360,11 @@ fn generate_private_ca_tls_config(
     write_generated_file(&relay_key_path, &material.relay_key_pem, true)?;
 
     Ok(PairTlsConfig {
-        relay_agent_tls_cert: Some(path_to_config_string(&relay_cert_path)?),
-        relay_agent_tls_key: Some(path_to_config_string(&relay_key_path)?),
-        allow_insecure_agent_link: false,
-        agent_relay_ca_cert: Some(path_to_config_string(&ca_cert_path)?),
-        allow_insecure_relay_link: false,
+        relay_tls_cert: Some(path_to_config_string(&relay_cert_path)?),
+        relay_tls_key: Some(path_to_config_string(&relay_key_path)?),
+        relay_allow_insecure: false,
+        relay_ca_cert: Some(path_to_config_string(&ca_cert_path)?),
+        agent_allow_insecure: false,
     })
 }
 
@@ -380,7 +380,7 @@ fn generate_private_ca_tls_material(relay_name: &str) -> Result<PrivateCaTlsMate
         CertificateParams::new(Vec::<String>::new()).context("failed to create CA params")?;
     ca_params
         .distinguished_name
-        .push(DnType::CommonName, "slay agent relay CA");
+        .push(DnType::CommonName, "slay relay CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
     ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);

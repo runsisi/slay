@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::token::validate_token_hash;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelayConfigFile {
     pub server: RelayServerConfig,
     #[serde(default)]
@@ -20,17 +21,19 @@ pub struct RelayConfigFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelayServerConfig {
     pub ssh_listen: SocketAddr,
-    pub agent_listen: SocketAddr,
+    pub relay_listen: SocketAddr,
     pub ssh_host_key: PathBuf,
-    pub agent_tls_cert: Option<PathBuf>,
-    pub agent_tls_key: Option<PathBuf>,
+    pub relay_tls_cert: Option<PathBuf>,
+    pub relay_tls_key: Option<PathBuf>,
     #[serde(default)]
-    pub allow_insecure_agent_link: bool,
+    pub allow_insecure_relay: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelayUserConfig {
     #[serde(default)]
     pub public_keys: Vec<String>,
@@ -39,6 +42,7 @@ pub struct RelayUserConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineConfig {
     pub machine_id: String,
     pub machine_alias: String,
@@ -58,11 +62,11 @@ pub struct RelayConfig {
 #[derive(Clone, Debug)]
 pub struct RuntimeRelayServerConfig {
     pub ssh_listen: SocketAddr,
-    pub agent_listen: SocketAddr,
+    pub relay_listen: SocketAddr,
     pub ssh_host_key: PathBuf,
-    pub agent_tls_cert: Option<PathBuf>,
-    pub agent_tls_key: Option<PathBuf>,
-    pub allow_insecure_agent_link: bool,
+    pub relay_tls_cert: Option<PathBuf>,
+    pub relay_tls_key: Option<PathBuf>,
+    pub allow_insecure_relay: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,12 +76,13 @@ struct RuntimeRelayUser {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub relay_addr: String,
     pub relay_name: Option<String>,
     pub relay_ca_cert: Option<PathBuf>,
     #[serde(default)]
-    pub allow_insecure_relay_link: bool,
+    pub allow_insecure_relay: bool,
     pub machine_id: String,
     pub agent_token: String,
     pub target: String,
@@ -111,13 +116,13 @@ impl RelayConfig {
         }
 
         let tls_pair_complete =
-            file.server.agent_tls_cert.is_some() == file.server.agent_tls_key.is_some();
+            file.server.relay_tls_cert.is_some() == file.server.relay_tls_key.is_some();
         if !tls_pair_complete {
-            bail!("agent_tls_cert and agent_tls_key must be configured together");
+            bail!("relay_tls_cert and relay_tls_key must be configured together");
         }
-        if file.server.agent_tls_cert.is_none() && !file.server.allow_insecure_agent_link {
+        if file.server.relay_tls_cert.is_none() && !file.server.allow_insecure_relay {
             bail!(
-                "agent TLS is required; configure agent_tls_cert/agent_tls_key or set allow_insecure_agent_link = true for local development"
+                "relay TLS is required; configure relay_tls_cert/relay_tls_key or set allow_insecure_relay = true for local development"
             );
         }
 
@@ -177,11 +182,11 @@ impl RelayConfig {
         Ok(Self {
             server: RuntimeRelayServerConfig {
                 ssh_listen: file.server.ssh_listen,
-                agent_listen: file.server.agent_listen,
+                relay_listen: file.server.relay_listen,
                 ssh_host_key: file.server.ssh_host_key,
-                agent_tls_cert: file.server.agent_tls_cert,
-                agent_tls_key: file.server.agent_tls_key,
-                allow_insecure_agent_link: file.server.allow_insecure_agent_link,
+                relay_tls_cert: file.server.relay_tls_cert,
+                relay_tls_key: file.server.relay_tls_key,
+                allow_insecure_relay: file.server.allow_insecure_relay,
             },
             users: Arc::new(users),
             machines_by_id: Arc::new(machines_by_id),
@@ -299,9 +304,9 @@ mod tests {
             r#"
 [server]
 ssh_listen = "127.0.0.1:2222"
-agent_listen = "127.0.0.1:4443"
+relay_listen = "127.0.0.1:4443"
 ssh_host_key = "/tmp/slay-test-host-key"
-allow_insecure_agent_link = true
+allow_insecure_relay = true
 
 [users.alice]
 public_keys = ["{}"]
@@ -358,9 +363,32 @@ target = "127.0.0.1:22"
 
     #[test]
     fn rejects_relay_config_without_tls_or_insecure_flag() {
-        let raw = base_config("alice-home-linux").replace("allow_insecure_agent_link = true\n", "");
+        let raw = base_config("alice-home-linux").replace("allow_insecure_relay = true\n", "");
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
-        assert!(err.to_string().contains("agent TLS is required"));
+        assert!(err.to_string().contains("relay TLS is required"));
+    }
+
+    #[test]
+    fn rejects_unknown_relay_server_field() {
+        let raw = base_config("alice-home-linux").replace(
+            "allow_insecure_relay = true",
+            "allow_insecure_relay = true\nunexpected_field = true",
+        );
+        let err = RelayConfig::from_toml_str(&raw).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_unknown_agent_field() {
+        let raw = r#"
+relay_addr = "relay.example.com:443"
+unexpected_field = true
+machine_id = "mch_01"
+agent_token = "01234567890123456789012345678901"
+target = "127.0.0.1:22"
+"#;
+        let err = toml::from_str::<AgentConfig>(raw).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
