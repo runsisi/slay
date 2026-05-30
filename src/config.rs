@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use russh::keys::{HashAlg, PublicKey};
+use russh::keys::{HashAlg, PrivateKey, PublicKey, decode_secret_key};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfigFile {
     pub server: RelayServerConfig,
@@ -18,14 +18,14 @@ pub struct RelayConfigFile {
     pub agents: HashMap<String, RelayAgentConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayServerConfig {
-    pub ssh_listen: SocketAddr,
-    pub ssh_host_key: PathBuf,
+    pub listen: SocketAddr,
+    pub host_key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayUserConfig {
     #[serde(default)]
@@ -34,7 +34,7 @@ pub struct RelayUserConfig {
     pub allowed_agents: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayAgentConfig {
     #[serde(default)]
@@ -42,41 +42,65 @@ pub struct RelayAgentConfig {
     pub target: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RelayConfig {
     pub server: RuntimeRelayServerConfig,
     users: Arc<HashMap<String, RuntimeRelayUser>>,
     agents_by_id: Arc<HashMap<String, RuntimeAgent>>,
 }
 
-#[derive(Clone, Debug)]
-pub struct RuntimeRelayServerConfig {
-    pub ssh_listen: SocketAddr,
-    pub ssh_host_key: PathBuf,
+impl std::fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("listen", &self.server.listen)
+            .field("users", &self.users.keys().collect::<Vec<_>>())
+            .field("agents", &self.agents_by_id.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
+pub struct RuntimeRelayServerConfig {
+    pub listen: SocketAddr,
+    pub host_key: PrivateKey,
+}
+
+#[derive(Clone)]
 struct RuntimeRelayUser {
     key_fingerprints: HashSet<String>,
     allowed_agents: HashSet<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct RuntimeAgent {
     config: RelayAgentConfig,
     agent_key_fingerprints: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub relay_addr: String,
-    pub relay_host_key: String,
+    #[serde(default)]
+    pub relay_known_hosts: Vec<String>,
     pub agent_id: String,
-    pub agent_private_key: PathBuf,
+    pub private_key: String,
     pub target: String,
     #[serde(default = "default_reconnect_secs")]
     pub reconnect_secs: u64,
+}
+
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("relay_addr", &self.relay_addr)
+            .field("relay_known_hosts", &self.relay_known_hosts)
+            .field("agent_id", &self.agent_id)
+            .field("private_key", &"<redacted>")
+            .field("target", &self.target)
+            .field("reconnect_secs", &self.reconnect_secs)
+            .finish()
+    }
 }
 
 fn default_reconnect_secs() -> u64 {
@@ -103,6 +127,8 @@ impl RelayConfig {
         if file.agents.is_empty() {
             bail!("relay config must define at least one agent");
         }
+        let host_key =
+            parse_private_key(&file.server.host_key).context("invalid server host_key")?;
 
         let mut agents_by_id = HashMap::new();
         for (agent_id, agent) in file.agents {
@@ -165,8 +191,8 @@ impl RelayConfig {
 
         Ok(Self {
             server: RuntimeRelayServerConfig {
-                ssh_listen: file.server.ssh_listen,
-                ssh_host_key: file.server.ssh_host_key,
+                listen: file.server.listen,
+                host_key,
             },
             users: Arc::new(users),
             agents_by_id: Arc::new(agents_by_id),
@@ -206,16 +232,21 @@ impl AgentConfig {
         Ok(config)
     }
 
-    pub fn relay_host_public_key(&self) -> Result<PublicKey> {
-        parse_public_key(&self.relay_host_key).context("invalid relay_host_key")
+    pub fn relay_known_host_fingerprints(&self) -> Result<HashSet<String>> {
+        known_host_fingerprints_for_addr(&self.relay_addr, &self.relay_known_hosts)
+            .context("invalid relay_known_hosts")
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.relay_addr.is_empty() {
             bail!("relay_addr cannot be empty");
         }
-        self.relay_host_public_key()?;
+        if self.relay_known_hosts.is_empty() {
+            bail!("relay_known_hosts cannot be empty");
+        }
+        self.relay_known_host_fingerprints()?;
         validate_identifier("agent_id", &self.agent_id)?;
+        parse_private_key(&self.private_key).context("invalid private_key")?;
         if self.reconnect_secs == 0 {
             bail!("reconnect_secs must be at least 1");
         }
@@ -230,8 +261,111 @@ pub fn parse_public_key(input: &str) -> Result<PublicKey> {
     PublicKey::from_openssh(input.trim()).map_err(Into::into)
 }
 
+pub fn parse_private_key(input: &str) -> Result<PrivateKey> {
+    decode_secret_key(input.trim(), None).map_err(Into::into)
+}
+
 pub fn fingerprint(key: &PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256).to_string()
+}
+
+pub fn render_known_host_entry(relay_addr: &str, public_key: &PublicKey) -> Result<String> {
+    let (host, port) = parse_relay_addr(relay_addr)?;
+    Ok(format!(
+        "{} {}",
+        known_host_pattern(&host, port),
+        public_key.to_openssh()?
+    ))
+}
+
+fn known_host_fingerprints_for_addr(
+    relay_addr: &str,
+    known_hosts: &[String],
+) -> Result<HashSet<String>> {
+    let (host, port) = parse_relay_addr(relay_addr)?;
+    let host_pattern = known_host_pattern(&host, port);
+    let mut fingerprints = HashSet::new();
+
+    for line in known_hosts {
+        let Some((patterns, public_key)) = parse_known_host_line(line)? else {
+            continue;
+        };
+        if patterns.split(',').any(|pattern| pattern == host_pattern) {
+            fingerprints.insert(fingerprint(&public_key));
+        }
+    }
+
+    if fingerprints.is_empty() {
+        bail!("relay_known_hosts has no entry for {host_pattern}");
+    }
+    Ok(fingerprints)
+}
+
+fn parse_known_host_line(line: &str) -> Result<Option<(&str, PublicKey)>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    let Some(key_type_index) = parts.iter().position(|part| is_ssh_public_key_type(part)) else {
+        bail!("known_hosts line is missing an SSH public key type");
+    };
+    if key_type_index == 0 {
+        bail!("known_hosts line is missing host patterns");
+    }
+    if key_type_index + 1 >= parts.len() {
+        bail!("known_hosts line is missing SSH public key body");
+    }
+
+    let public_key = parse_public_key(&parts[key_type_index..].join(" "))?;
+    Ok(Some((parts[0], public_key)))
+}
+
+fn is_ssh_public_key_type(key_type: &str) -> bool {
+    matches!(
+        key_type,
+        "ssh-ed25519"
+            | "ssh-rsa"
+            | "rsa-sha2-256"
+            | "rsa-sha2-512"
+            | "sk-ssh-ed25519@openssh.com"
+            | "sk-ecdsa-sha2-nistp256@openssh.com"
+    ) || key_type.starts_with("ecdsa-sha2-")
+}
+
+fn parse_relay_addr(relay_addr: &str) -> Result<(String, u16)> {
+    let relay_addr = relay_addr.trim();
+    if let Some(rest) = relay_addr.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            bail!("relay_addr must be host:port or [ipv6]:port");
+        };
+        return Ok((host.to_string(), parse_port(port)?));
+    }
+
+    let Some((host, port)) = relay_addr.rsplit_once(':') else {
+        bail!("relay_addr must include a port");
+    };
+    if host.is_empty() {
+        bail!("relay_addr host cannot be empty");
+    }
+    if host.contains(':') {
+        bail!("relay_addr IPv6 hosts must use [host]:port");
+    }
+    Ok((host.to_string(), parse_port(port)?))
+}
+
+fn parse_port(port: &str) -> Result<u16> {
+    port.parse::<u16>()
+        .with_context(|| format!("invalid relay_addr port {port:?}"))
+}
+
+fn known_host_pattern(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
@@ -250,21 +384,27 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh::keys::{Algorithm, PrivateKey};
+    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 
     fn public_key_line() -> String {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         key.public_key().to_openssh().unwrap()
     }
 
+    fn private_key_block() -> String {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        key.to_openssh(LineEnding::LF).unwrap().to_string()
+    }
+
     fn base_config(agent_id: &str) -> String {
         let user_key = public_key_line();
         let agent_key = public_key_line();
+        let host_key = private_key_block();
         format!(
             r#"
 [server]
-ssh_listen = "127.0.0.1:2222"
-ssh_host_key = "/tmp/slay-test-host-key"
+listen = "127.0.0.1:2222"
+host_key = '''{}'''
 
 [users.alice]
 authorized_keys = ["{}"]
@@ -274,7 +414,7 @@ allowed_agents = ["{}"]
 agent_authorized_keys = ["{}"]
 target = "127.0.0.1:22"
 "#,
-            user_key, agent_id, agent_id, agent_key
+            host_key, user_key, agent_id, agent_id, agent_key
         )
     }
 
@@ -329,8 +469,8 @@ target = "127.0.0.1:22"
     #[test]
     fn rejects_unknown_relay_server_field() {
         let raw = base_config("alice-home-linux").replace(
-            "ssh_host_key = \"/tmp/slay-test-host-key\"",
-            "ssh_host_key = \"/tmp/slay-test-host-key\"\nunexpected_field = true",
+            "listen = \"127.0.0.1:2222\"",
+            "listen = \"127.0.0.1:2222\"\nunexpected_field = true",
         );
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
         assert!(format!("{err:#}").contains("unknown field"));
@@ -338,15 +478,18 @@ target = "127.0.0.1:22"
 
     #[test]
     fn rejects_unknown_agent_field() {
+        let relay_key = public_key_line();
         let raw = r#"
 relay_addr = "relay.example.com:2222"
-relay_host_key = "ssh-ed25519 AAAA relay@example"
+relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
 unexpected_field = true
 agent_id = "alice-home-linux"
-agent_private_key = "/etc/slay/agent_ed25519"
+private_key = '''PRIVATE_KEY'''
 target = "127.0.0.1:22"
-"#;
-        let err = toml::from_str::<AgentConfig>(raw).unwrap_err();
+"#
+        .replace("RELAY_KEY", &relay_key)
+        .replace("PRIVATE_KEY", &private_key_block());
+        let err = toml::from_str::<AgentConfig>(&raw).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
     }
 
@@ -371,16 +514,50 @@ target = "127.0.0.1:22"
         let relay_key = public_key_line();
         let raw = r#"
 relay_addr = "relay.example.com:2222"
-relay_host_key = "RELAY_KEY"
+relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
 agent_id = "mch_01"
-agent_private_key = "/etc/slay/agent_ed25519"
+private_key = '''PRIVATE_KEY'''
 target = "127.0.0.1:22"
 reconnect_secs = 0
 "#
-        .replace("RELAY_KEY", &relay_key);
+        .replace("RELAY_KEY", &relay_key)
+        .replace("PRIVATE_KEY", &private_key_block());
         let config: AgentConfig = toml::from_str(&raw).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("reconnect_secs"));
+    }
+
+    #[test]
+    fn validates_known_hosts_entry_for_relay_addr() {
+        let relay_key = public_key_line();
+        let raw = r#"
+relay_addr = "relay.example.com:2222"
+relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
+agent_id = "mch_01"
+private_key = '''PRIVATE_KEY'''
+target = "127.0.0.1:22"
+"#
+        .replace("RELAY_KEY", &relay_key)
+        .replace("PRIVATE_KEY", &private_key_block());
+        let config: AgentConfig = toml::from_str(&raw).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_known_hosts_without_relay_addr_entry() {
+        let relay_key = public_key_line();
+        let raw = r#"
+relay_addr = "relay.example.com:2222"
+relay_known_hosts = ["[other.example.com]:2222 RELAY_KEY"]
+agent_id = "mch_01"
+private_key = '''PRIVATE_KEY'''
+target = "127.0.0.1:22"
+"#
+        .replace("RELAY_KEY", &relay_key)
+        .replace("PRIVATE_KEY", &private_key_block());
+        let config: AgentConfig = toml::from_str(&raw).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("relay_known_hosts"));
     }
 
     #[test]

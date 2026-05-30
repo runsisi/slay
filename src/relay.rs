@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use russh::keys::{Certificate, PublicKey, load_secret_key};
+use russh::keys::{Certificate, PublicKey};
 use russh::server::{self, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
@@ -134,33 +134,22 @@ impl RelayState {
 
 pub async fn run_relay_server(config: RelayConfig) -> Result<()> {
     let state = RelayState::new(config);
-    run_ssh_listener(state).await
+    run_listener(state).await
 }
 
-async fn run_ssh_listener(state: RelayState) -> Result<()> {
-    let key = load_secret_key(&state.config.server.ssh_host_key, None).with_context(|| {
-        format!(
-            "failed to load SSH host key {}",
-            state.config.server.ssh_host_key.display()
-        )
-    })?;
+async fn run_listener(state: RelayState) -> Result<()> {
     let config = russh::server::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         auth_rejection_time: Duration::from_secs(3),
         auth_rejection_time_initial: Some(Duration::ZERO),
-        keys: vec![key],
+        keys: vec![state.config.server.host_key.clone()],
         ..Default::default()
     };
     let config = Arc::new(config);
-    let listener = TcpListener::bind(state.config.server.ssh_listen)
+    let listener = TcpListener::bind(state.config.server.listen)
         .await
-        .with_context(|| {
-            format!(
-                "failed to bind SSH listener {}",
-                state.config.server.ssh_listen
-            )
-        })?;
-    info!("ssh listener bound to {}", state.config.server.ssh_listen);
+        .with_context(|| format!("failed to bind listener {}", state.config.server.listen))?;
+    info!("listener bound to {}", state.config.server.listen);
     let mut server = SshRelayServer { state };
     server.run_on_socket(config, &listener).await?;
     Ok(())
@@ -476,22 +465,28 @@ async fn relay_user_channel_to_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh::keys::{Algorithm, PrivateKey};
+    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 
     fn public_key_line() -> String {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         key.public_key().to_openssh().unwrap()
     }
 
+    fn private_key_block() -> String {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        key.to_openssh(LineEnding::LF).unwrap().to_string()
+    }
+
     fn relay_config() -> RelayConfig {
         let user_key = public_key_line();
         let agent_key_a = public_key_line();
         let agent_key_b = public_key_line();
+        let host_key = private_key_block();
         let raw = format!(
             r#"
 [server]
-ssh_listen = "127.0.0.1:2222"
-ssh_host_key = "/tmp/slay-test-host-key"
+listen = "127.0.0.1:2222"
+host_key = '''{host_key}'''
 
 [users.alice]
 authorized_keys = ["{user_key}"]

@@ -67,7 +67,7 @@ MVP 固定采用以下决策：
 - agent 到 relay 的链路使用 SSH 加密和 SSH host key 校验，不引入单独 TLS。
 - 每台 PC 使用全局唯一、可读的 `agent_id` 作为 agent SSH 用户名和用户侧目标 host。
 - relay 侧为每个 agent 配置 `agent_authorized_keys`。
-- agent 侧配置对应私钥路径 `agent_private_key` 和 relay SSH host public key `relay_host_key`。
+- agent 侧配置内嵌 `private_key` 和 `relay_known_hosts`。
 - 手机 SSH 客户端使用 `agent_id` 作为 Jump Host 目标 host。
 - MVP 只支持转发到 PC 本机 sshd，即 `127.0.0.1:22`。
 - relay 只支持 `direct-tcpip` 和 agent remote forwarding 所需能力，不提供可交互 shell。
@@ -101,7 +101,7 @@ relay 上只能保存公钥和 ACL 配置：
   - PC 登录私钥
 
 relay/VPS：
-  - relay 自己的 SSH host 私钥
+  - relay 自己的 SSH host 私钥，内嵌在 relay 配置 `[server].host_key`
   - relay 用户 authorized_keys
   - agent_authorized_keys
   - 用户到 agent 的 ACL
@@ -109,8 +109,8 @@ relay/VPS：
 PC：
   - sshd host 私钥
   - PC 用户 authorized_keys
-  - slay agent 私钥
-  - relay SSH host public key
+  - slay agent 私钥，内嵌在 agent 配置 `private_key`
+  - relay SSH known_hosts 条目
 ```
 
 推荐给三层使用不同密钥：
@@ -260,8 +260,12 @@ relay 配置示例：
 
 ```toml
 [server]
-ssh_listen = "0.0.0.0:2222"
-ssh_host_key = "/etc/slay/relay_host_ed25519"
+listen = "0.0.0.0:2222"
+host_key = '''
+-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----
+'''
 
 [users.alice]
 authorized_keys = [
@@ -289,9 +293,15 @@ agent 配置示例：
 
 ```toml
 relay_addr = "relay.example.com:2222"
-relay_host_key = "ssh-ed25519 DDDD... relay-host"
+relay_known_hosts = [
+  "[relay.example.com]:2222 ssh-ed25519 DDDD... relay-host"
+]
 agent_id = "alice-home-linux"
-agent_private_key = "/etc/slay/agent_ed25519"
+private_key = '''
+-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----
+'''
 target = "127.0.0.1:22"
 reconnect_secs = 5
 ```
@@ -312,7 +322,7 @@ reconnect_secs = 5
 - `slay` 二进制。
 - `slay relay` 子命令。
 - `slay agent` 子命令。
-- `slay config init` 一次生成匹配的 relay/agent 配置，并写入 relay 用户 authorized keys、agent authorized keys、relay host key 和 agent private key path。
+- `slay config init` 一次生成匹配的 relay/agent 配置，并写入 relay 用户 authorized keys、agent authorized keys、relay host key 和 agent private key。
 - `slay config gen relay|agent` 分别生成单侧配置。
 - `slay config validate` 校验 relay/agent 配置。
 - relay 用户 SSH 公钥认证。
@@ -342,7 +352,7 @@ reconnect_secs = 5
 
 - relay 不保存 PC 登录私钥或 PC 登录密码。
 - relay 不支持密码登录，只允许 SSH 公钥认证。
-- agent 不保存 relay 私钥，只保存 relay SSH host public key 用于校验。
+- agent 不保存 relay 私钥，只保存 relay SSH known_hosts 条目用于校验。
 - 每个 agent 使用独立 agent SSH key。
 - relay 只保存 agent public key，不保存 agent private key。
 - 每个 relay 用户配置可访问的 agent allowlist。

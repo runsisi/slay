@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,11 +7,10 @@ use russh::Channel;
 use russh::client;
 use russh::client::Msg;
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::load_secret_key;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::config::{AgentConfig, fingerprint};
+use crate::config::{AgentConfig, fingerprint, parse_private_key};
 
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
     loop {
@@ -23,21 +23,15 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
 }
 
 async fn connect_once(config: AgentConfig) -> Result<()> {
-    let expected_relay_host_key = config.relay_host_public_key()?;
-    let expected_relay_host_key_fingerprint = fingerprint(&expected_relay_host_key);
-    let agent_key = load_secret_key(&config.agent_private_key, None).with_context(|| {
-        format!(
-            "failed to load agent private key {}",
-            config.agent_private_key.display()
-        )
-    })?;
+    let expected_relay_known_host_fingerprints = config.relay_known_host_fingerprints()?;
+    let agent_key = parse_private_key(&config.private_key).context("invalid agent private_key")?;
     let client_config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         nodelay: true,
         ..Default::default()
     });
     let handler = AgentSshClient {
-        expected_relay_host_key_fingerprint,
+        expected_relay_known_host_fingerprints,
         agent_id: config.agent_id.clone(),
         target: config.target.clone(),
     };
@@ -71,7 +65,7 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
 }
 
 struct AgentSshClient {
-    expected_relay_host_key_fingerprint: String,
+    expected_relay_known_host_fingerprints: HashSet<String>,
     agent_id: String,
     target: String,
 }
@@ -83,7 +77,9 @@ impl client::Handler for AgentSshClient {
         &mut self,
         server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(fingerprint(server_public_key) == self.expected_relay_host_key_fingerprint)
+        Ok(self
+            .expected_relay_known_host_fingerprints
+            .contains(&fingerprint(server_public_key)))
     }
 
     async fn server_channel_open_forwarded_tcpip(

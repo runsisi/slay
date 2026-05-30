@@ -5,11 +5,14 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 use slay::agent::run_agent;
-use slay::config::{AgentConfig, RelayConfig, parse_public_key};
+use slay::config::{
+    AgentConfig, RelayConfig, parse_private_key, parse_public_key, render_known_host_entry,
+};
 use slay::config_templates::{
-    AGENT_CONFIG_TEMPLATE, DEFAULT_AGENT_PRIVATE_KEY_PATH, PairTemplateInput,
-    RELAY_CONFIG_TEMPLATE, render_agent_config, render_relay_config,
+    AGENT_CONFIG_TEMPLATE, PairTemplateInput, RELAY_CONFIG_TEMPLATE, render_agent_config,
+    render_relay_config,
 };
 use slay::relay::run_relay_server;
 
@@ -61,10 +64,10 @@ enum ConfigCommand {
         agent_authorized_keys: Vec<PathBuf>,
         #[arg(long = "agent-authorized-keys", value_name = "PATH")]
         agent_authorized_key_files: Vec<PathBuf>,
-        #[arg(long = "relay-host-public-key", value_name = "PATH")]
-        relay_host_public_key: Option<PathBuf>,
-        #[arg(long, default_value = DEFAULT_AGENT_PRIVATE_KEY_PATH)]
-        agent_private_key: PathBuf,
+        #[arg(long = "relay-host-key", value_name = "PATH")]
+        host_key: Option<PathBuf>,
+        #[arg(long = "agent-private-key", value_name = "PATH")]
+        agent_key: Option<PathBuf>,
         #[arg(short, long)]
         force: bool,
     },
@@ -139,8 +142,8 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
             relay_authorized_key_files,
             agent_authorized_keys,
             agent_authorized_key_files,
-            relay_host_public_key,
-            agent_private_key,
+            host_key,
+            agent_key,
             force,
         } => write_pair_templates(PairInitOptions {
             relay_output: &relay_output,
@@ -152,8 +155,8 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
             relay_authorized_key_files: &relay_authorized_key_files,
             agent_authorized_keys: &agent_authorized_keys,
             agent_authorized_key_files: &agent_authorized_key_files,
-            relay_host_public_key: relay_host_public_key.as_deref(),
-            agent_private_key: &agent_private_key,
+            host_key: host_key.as_deref(),
+            agent_key: agent_key.as_deref(),
             force,
         }),
         ConfigCommand::Gen { target } => match target {
@@ -208,8 +211,8 @@ struct PairInitOptions<'a> {
     relay_authorized_key_files: &'a [PathBuf],
     agent_authorized_keys: &'a [PathBuf],
     agent_authorized_key_files: &'a [PathBuf],
-    relay_host_public_key: Option<&'a Path>,
-    agent_private_key: &'a Path,
+    host_key: Option<&'a Path>,
+    agent_key: Option<&'a Path>,
     force: bool,
 }
 
@@ -235,28 +238,34 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
             .push("ssh-ed25519 REPLACE_WITH_RELAY_USER_AUTHORIZED_KEY alice@example".to_string());
     }
 
+    let private_key = read_or_generate_private_key("agent private key", options.agent_key)?;
+    let agent_public_key = parse_private_key(&private_key)
+        .context("invalid agent private key")?
+        .public_key()
+        .to_openssh()
+        .context("failed to encode agent public key")?;
+
     let mut agent_authorized_keys = read_authorized_public_keys(
         "agent authorized key",
         options.agent_authorized_keys,
         options.agent_authorized_key_files,
     )?;
-    if agent_authorized_keys.is_empty() {
-        agent_authorized_keys
-            .push("ssh-ed25519 REPLACE_WITH_AGENT_AUTHORIZED_KEY alice-home-agent".to_string());
-    }
+    push_unique_authorized_key(&mut agent_authorized_keys, agent_public_key);
 
-    let relay_host_key = match options.relay_host_public_key {
-        Some(path) => read_single_public_key("relay host public key", path)?,
-        None => "ssh-ed25519 REPLACE_WITH_RELAY_HOST_PUBLIC_KEY relay@example".to_string(),
-    };
-    let agent_private_key = path_to_config_string(options.agent_private_key)?;
+    let host_key = read_or_generate_private_key("relay host key", options.host_key)?;
+    let host_private_key = parse_private_key(&host_key).context("invalid relay host key")?;
+    let relay_known_hosts = vec![render_known_host_entry(
+        options.relay_addr,
+        host_private_key.public_key(),
+    )?];
     let input = PairTemplateInput {
         relay_user: options.relay_user,
         relay_authorized_keys: &relay_authorized_keys,
         agent_authorized_keys: &agent_authorized_keys,
         relay_addr: options.relay_addr,
-        relay_host_key: &relay_host_key,
-        agent_private_key: &agent_private_key,
+        host_key: &host_key,
+        relay_known_hosts: &relay_known_hosts,
+        private_key: &private_key,
         agent_id: options.agent_id,
     };
 
@@ -294,6 +303,19 @@ fn read_single_public_key(label: &str, path: &Path) -> Result<String> {
             path.display()
         ),
     }
+}
+
+fn read_or_generate_private_key(label: &str, path: Option<&Path>) -> Result<String> {
+    if let Some(path) = path {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {label} {}", path.display()))?;
+        parse_private_key(&raw).with_context(|| format!("invalid {label} {}", path.display()))?;
+        return Ok(raw);
+    }
+
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+        .with_context(|| format!("failed to generate {label}"))?;
+    Ok(key.to_openssh(LineEnding::LF)?.to_string())
 }
 
 fn read_authorized_keys_file(label: &str, path: &Path) -> Result<Vec<String>> {
@@ -353,12 +375,6 @@ fn push_unique_authorized_key(keys: &mut Vec<String>, key: String) {
     if !keys.iter().any(|existing| existing == &key) {
         keys.push(key);
     }
-}
-
-fn path_to_config_string(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(ToString::to_string)
-        .with_context(|| format!("path must be valid UTF-8: {}", path.display()))
 }
 
 fn validate_agent_id(agent_id: &str) -> Result<()> {
