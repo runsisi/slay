@@ -1,10 +1,14 @@
 use std::{
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 use slay::agent::run_agent;
 use slay::config::{AgentConfig, RelayConfig, parse_public_key};
 use slay::config_templates::{
@@ -69,6 +73,10 @@ enum ConfigInitTarget {
         relay_output: PathBuf,
         #[arg(long, default_value = "slay-agent.toml")]
         agent_output: PathBuf,
+        #[arg(long, default_value = "relay.example.com:443")]
+        relay_addr: String,
+        #[arg(long)]
+        relay_name: Option<String>,
         #[arg(long, default_value = "home-linux")]
         machine_alias: String,
         #[arg(long, default_value = "Home Linux")]
@@ -77,6 +85,10 @@ enum ConfigInitTarget {
         relay_user: String,
         #[arg(long)]
         relay_public_key: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = AgentTlsMode::PrivateCa)]
+        agent_tls: AgentTlsMode,
+        #[arg(long, default_value = "slay-tls")]
+        tls_dir: PathBuf,
         #[arg(short, long)]
         force: bool,
     },
@@ -94,6 +106,13 @@ enum ConfigInitTarget {
         #[arg(short, long)]
         force: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum AgentTlsMode {
+    PrivateCa,
+    External,
+    Insecure,
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,20 +150,28 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
             ConfigInitTarget::Pair {
                 relay_output,
                 agent_output,
+                relay_addr,
+                relay_name,
                 machine_alias,
                 display_name,
                 relay_user,
                 relay_public_key,
+                agent_tls,
+                tls_dir,
                 force,
-            } => write_pair_templates(
-                &relay_output,
-                &agent_output,
-                &machine_alias,
-                &display_name,
-                &relay_user,
-                relay_public_key.as_deref(),
+            } => write_pair_templates(PairInitOptions {
+                relay_output: &relay_output,
+                agent_output: &agent_output,
+                relay_addr: &relay_addr,
+                relay_name: relay_name.as_deref(),
+                machine_alias: &machine_alias,
+                display_name: &display_name,
+                relay_user: &relay_user,
+                relay_public_key: relay_public_key.as_deref(),
+                agent_tls,
+                tls_dir: &tls_dir,
                 force,
-            ),
+            }),
             ConfigInitTarget::Relay { output, force } => {
                 write_template(&output, RELAY_CONFIG_TEMPLATE, force)
             }
@@ -201,27 +228,43 @@ fn write_template(output: &Path, content: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn write_pair_templates(
-    relay_output: &Path,
-    agent_output: &Path,
-    machine_alias: &str,
-    display_name: &str,
-    relay_user: &str,
-    relay_public_key: Option<&Path>,
+struct PairInitOptions<'a> {
+    relay_output: &'a Path,
+    agent_output: &'a Path,
+    relay_addr: &'a str,
+    relay_name: Option<&'a str>,
+    machine_alias: &'a str,
+    display_name: &'a str,
+    relay_user: &'a str,
+    relay_public_key: Option<&'a Path>,
+    agent_tls: AgentTlsMode,
+    tls_dir: &'a Path,
     force: bool,
-) -> Result<()> {
-    if relay_output == agent_output {
+}
+
+fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
+    if options.relay_output == options.agent_output {
         bail!("relay_output and agent_output must be different paths");
     }
-    validate_machine_alias(machine_alias)?;
-    validate_config_table_key("relay_user", relay_user)?;
-    ensure_can_write(relay_output, force)?;
-    ensure_can_write(agent_output, force)?;
+    if options.relay_addr.is_empty() {
+        bail!("relay_addr cannot be empty");
+    }
+    let relay_name = resolve_relay_name(options.relay_addr, options.relay_name)?;
+    validate_machine_alias(options.machine_alias)?;
+    validate_config_table_key("relay_user", options.relay_user)?;
+    ensure_can_write(options.relay_output, options.force)?;
+    ensure_can_write(options.agent_output, options.force)?;
+    let tls_config = prepare_pair_tls_config(
+        options.agent_tls,
+        options.tls_dir,
+        &relay_name,
+        options.force,
+    )?;
 
     let agent_token = generate_token();
     let agent_token_hash = hash_token(&agent_token)?;
     let machine_id = generate_machine_id();
-    let relay_public_key = match relay_public_key {
+    let relay_public_key = match options.relay_public_key {
         Some(path) => {
             let key = fs::read_to_string(path)
                 .with_context(|| format!("failed to read relay public key {}", path.display()))?;
@@ -233,18 +276,206 @@ fn write_pair_templates(
         None => "ssh-ed25519 REPLACE_WITH_RELAY_USER_PUBLIC_KEY alice@example".to_string(),
     };
     let input = PairTemplateInput {
-        relay_user,
+        relay_user: options.relay_user,
         relay_public_key: &relay_public_key,
+        relay_addr: options.relay_addr,
+        relay_name: &relay_name,
+        relay_agent_tls_cert: tls_config.relay_agent_tls_cert.as_deref(),
+        relay_agent_tls_key: tls_config.relay_agent_tls_key.as_deref(),
+        allow_insecure_agent_link: tls_config.allow_insecure_agent_link,
+        agent_relay_ca_cert: tls_config.agent_relay_ca_cert.as_deref(),
+        allow_insecure_relay_link: tls_config.allow_insecure_relay_link,
         machine_id: &machine_id,
-        machine_alias,
-        display_name,
+        machine_alias: options.machine_alias,
+        display_name: options.display_name,
         agent_token: &agent_token,
         agent_token_hash: &agent_token_hash,
     };
 
-    write_template(relay_output, &render_relay_config(&input), true)?;
-    write_template(agent_output, &render_agent_config(&input), true)?;
+    write_template(options.relay_output, &render_relay_config(&input), true)?;
+    write_template(options.agent_output, &render_agent_config(&input), true)?;
     Ok(())
+}
+
+struct PairTlsConfig {
+    relay_agent_tls_cert: Option<String>,
+    relay_agent_tls_key: Option<String>,
+    allow_insecure_agent_link: bool,
+    agent_relay_ca_cert: Option<String>,
+    allow_insecure_relay_link: bool,
+}
+
+fn prepare_pair_tls_config(
+    mode: AgentTlsMode,
+    tls_dir: &Path,
+    relay_name: &str,
+    force: bool,
+) -> Result<PairTlsConfig> {
+    match mode {
+        AgentTlsMode::PrivateCa => generate_private_ca_tls_config(tls_dir, relay_name, force),
+        AgentTlsMode::External => Ok(PairTlsConfig {
+            relay_agent_tls_cert: None,
+            relay_agent_tls_key: None,
+            allow_insecure_agent_link: false,
+            agent_relay_ca_cert: None,
+            allow_insecure_relay_link: false,
+        }),
+        AgentTlsMode::Insecure => Ok(PairTlsConfig {
+            relay_agent_tls_cert: None,
+            relay_agent_tls_key: None,
+            allow_insecure_agent_link: true,
+            agent_relay_ca_cert: None,
+            allow_insecure_relay_link: true,
+        }),
+    }
+}
+
+fn generate_private_ca_tls_config(
+    tls_dir: &Path,
+    relay_name: &str,
+    force: bool,
+) -> Result<PairTlsConfig> {
+    let tls_dir = absolute_path(tls_dir)?;
+    let ca_cert_path = tls_dir.join("agent_ca.crt");
+    let ca_key_path = tls_dir.join("agent_ca.key");
+    let relay_cert_path = tls_dir.join("agent_relay.crt");
+    let relay_key_path = tls_dir.join("agent_relay.key");
+    for path in [
+        &ca_cert_path,
+        &ca_key_path,
+        &relay_cert_path,
+        &relay_key_path,
+    ] {
+        ensure_can_write(path, force)?;
+    }
+
+    let material = generate_private_ca_tls_material(relay_name)?;
+    fs::create_dir_all(&tls_dir)
+        .with_context(|| format!("failed to create TLS directory {}", tls_dir.display()))?;
+    write_generated_file(&ca_cert_path, &material.ca_cert_pem, false)?;
+    write_generated_file(&ca_key_path, &material.ca_key_pem, true)?;
+    write_generated_file(&relay_cert_path, &material.relay_cert_pem, false)?;
+    write_generated_file(&relay_key_path, &material.relay_key_pem, true)?;
+
+    Ok(PairTlsConfig {
+        relay_agent_tls_cert: Some(path_to_config_string(&relay_cert_path)?),
+        relay_agent_tls_key: Some(path_to_config_string(&relay_key_path)?),
+        allow_insecure_agent_link: false,
+        agent_relay_ca_cert: Some(path_to_config_string(&ca_cert_path)?),
+        allow_insecure_relay_link: false,
+    })
+}
+
+struct PrivateCaTlsMaterial {
+    ca_cert_pem: String,
+    ca_key_pem: String,
+    relay_cert_pem: String,
+    relay_key_pem: String,
+}
+
+fn generate_private_ca_tls_material(relay_name: &str) -> Result<PrivateCaTlsMaterial> {
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).context("failed to create CA params")?;
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "slay agent relay CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    ca_params.key_usages.push(KeyUsagePurpose::CrlSign);
+
+    let ca_key = KeyPair::generate().context("failed to generate CA key")?;
+    let ca_key_pem = ca_key.serialize_pem();
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .context("failed to generate CA certificate")?;
+    let ca_cert_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let mut relay_params = CertificateParams::new(vec![relay_name.to_string()])
+        .with_context(|| format!("failed to create relay certificate params for {relay_name}"))?;
+    relay_params
+        .distinguished_name
+        .push(DnType::CommonName, relay_name);
+    relay_params.is_ca = IsCa::ExplicitNoCa;
+    relay_params.use_authority_key_identifier_extension = true;
+    relay_params
+        .key_usages
+        .push(KeyUsagePurpose::DigitalSignature);
+    relay_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+
+    let relay_key = KeyPair::generate().context("failed to generate relay TLS key")?;
+    let relay_key_pem = relay_key.serialize_pem();
+    let relay_cert = relay_params
+        .signed_by(&relay_key, &issuer)
+        .context("failed to generate relay TLS certificate")?;
+
+    Ok(PrivateCaTlsMaterial {
+        ca_cert_pem,
+        ca_key_pem,
+        relay_cert_pem: relay_cert.pem(),
+        relay_key_pem,
+    })
+}
+
+fn write_generated_file(path: &Path, content: &str, private: bool) -> Result<()> {
+    fs::write(path, content)
+        .with_context(|| format!("failed to write generated file {}", path.display()))?;
+    if private {
+        set_private_file_permissions(path)?;
+    }
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set private permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn resolve_relay_name(relay_addr: &str, relay_name: Option<&str>) -> Result<String> {
+    let name = relay_name.unwrap_or_else(|| relay_host_from_addr(relay_addr));
+    if name.is_empty() {
+        bail!("relay_name cannot be empty");
+    }
+    Ok(name.to_string())
+}
+
+fn relay_host_from_addr(relay_addr: &str) -> &str {
+    if let Some(rest) = relay_addr.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host;
+    }
+    relay_addr
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(relay_addr)
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(env::current_dir()
+        .context("failed to read current directory")?
+        .join(path))
+}
+
+fn path_to_config_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(ToString::to_string)
+        .with_context(|| format!("path must be valid UTF-8: {}", path.display()))
 }
 
 fn validate_machine_alias(machine_alias: &str) -> Result<()> {

@@ -24,9 +24,14 @@ Create matching relay and agent configs with a generated `machine_id`, `agent_to
 slay config init pair \
   --relay-output slay-relay.toml \
   --agent-output slay-agent.toml \
+  --relay-addr relay.example.com:443 \
+  --relay-name relay.example.com \
   --relay-user alice \
-  --relay-public-key ~/.ssh/id_relay.pub
+  --relay-public-key ~/.ssh/id_relay.pub \
+  --tls-dir ./slay-tls
 ```
+
+By default this uses `--agent-tls private-ca`, creates a private CA plus a relay server certificate in `--tls-dir`, and writes the matching TLS paths into both configs.
 
 Set the machine alias and display name during paired generation:
 
@@ -37,6 +42,31 @@ slay config init pair \
 ```
 
 If `--relay-public-key` is omitted, the relay config contains a placeholder public key and will not pass `slay config validate relay` until that key is replaced.
+
+Select agent-link TLS mode:
+
+```bash
+# Default: generate a private CA and relay certificate.
+slay config init pair --agent-tls private-ca --tls-dir ./slay-tls
+
+# Use externally managed TLS files, such as a public CA certificate.
+slay config init pair --agent-tls external
+
+# Local development only.
+slay config init pair --agent-tls insecure
+```
+
+`private-ca` creates:
+
+```text
+slay-tls/
+  agent_ca.crt
+  agent_ca.key
+  agent_relay.crt
+  agent_relay.key
+```
+
+Keep `agent_ca.key` and `agent_relay.key` private. Do not copy `agent_ca.key` to agent machines.
 
 Create a relay config template:
 
@@ -94,8 +124,12 @@ slay config hash-token 'at-least-32-random-characters-here'
 slay config init pair \
   --relay-output slay-relay.toml \
   --agent-output slay-agent.toml \
+  --relay-addr relay.example.com:443 \
+  --relay-name relay.example.com \
   --relay-user alice \
   --relay-public-key ~/.ssh/id_relay.pub \
+  --agent-tls private-ca \
+  --tls-dir ./slay-tls \
   --machine-alias alice-home-linux \
   --display-name "Alice Home Linux"
 ```
@@ -103,18 +137,24 @@ slay config init pair \
 2. Edit `slay-relay.toml`:
 
 - Set the relay SSH host key path.
-- Set agent TLS certificate/key paths.
+- Keep or deploy the generated `agent_tls_cert` and `agent_tls_key` paths.
 - If `--relay-public-key` was not used, replace relay user public keys.
 - Keep `machine_alias` unique.
 
 3. Edit `slay-agent.toml`:
 
-- Set `relay_addr`.
-- Set `relay_name`; set `relay_ca_cert` when using a private CA or self-signed relay certificate.
+- Confirm `relay_addr` and `relay_name`.
+- Keep `relay_ca_cert` when using `--agent-tls private-ca`; omit it only when the relay certificate uses a public CA.
 - Use the same `machine_id` configured in relay config.
 - Keep the generated `agent_token`.
 
-For local development only, plain agent links can be enabled explicitly:
+For local development only, generate plain agent links explicitly:
+
+```bash
+slay config init pair --agent-tls insecure
+```
+
+This writes:
 
 ```toml
 # slay-relay.toml
