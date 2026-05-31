@@ -39,7 +39,14 @@ pub struct RelayUserConfig {
 pub struct RelayAgentConfig {
     #[serde(default)]
     pub agent_authorized_keys: Vec<String>,
-    pub forward_target: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentForwardTarget {
+    pub name: String,
+    pub port: u32,
+    pub target: String,
 }
 
 #[derive(Clone)]
@@ -85,7 +92,8 @@ pub struct AgentConfig {
     pub relay_known_hosts: Vec<String>,
     pub agent_id: String,
     pub agent_private_key: String,
-    pub forward_target: String,
+    #[serde(default)]
+    pub forward_targets: Vec<AgentForwardTarget>,
     #[serde(default = "default_reconnect_secs")]
     pub reconnect_secs: u64,
 }
@@ -97,7 +105,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("relay_known_hosts", &self.relay_known_hosts)
             .field("agent_id", &self.agent_id)
             .field("agent_private_key", &"<redacted>")
-            .field("forward_target", &self.forward_target)
+            .field("forward_targets", &self.forward_targets)
             .field("reconnect_secs", &self.reconnect_secs)
             .finish()
     }
@@ -134,9 +142,6 @@ impl RelayConfig {
             validate_identifier("agent_id", &agent_id)?;
             if agent.agent_authorized_keys.is_empty() {
                 bail!("agent {agent_id} must have at least one agent authorized key");
-            }
-            if agent.forward_target != "127.0.0.1:22" {
-                bail!("agent {agent_id} forward_target must be 127.0.0.1:22 for the SSH-only MVP");
             }
             let mut agent_key_fingerprints = HashSet::new();
             for public_key in &agent.agent_authorized_keys {
@@ -249,8 +254,17 @@ impl AgentConfig {
         if self.reconnect_secs == 0 {
             bail!("reconnect_secs must be at least 1");
         }
-        if self.forward_target != "127.0.0.1:22" {
-            bail!("agent forward_target must be 127.0.0.1:22 for the SSH-only MVP");
+        if self.forward_targets.is_empty() {
+            bail!("forward_targets cannot be empty");
+        }
+        let mut routes = HashSet::new();
+        for target in &self.forward_targets {
+            validate_forward_name("forward target name", &target.name)?;
+            validate_forward_port("forward target port", target.port)?;
+            parse_host_port("target", &target.target)?;
+            if !routes.insert((target.name.clone(), target.port)) {
+                bail!("duplicate forward target {}:{}", target.name, target.port);
+            }
         }
         Ok(())
     }
@@ -266,6 +280,10 @@ pub fn parse_private_key(input: &str) -> Result<PrivateKey> {
 
 pub fn fingerprint(key: &PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256).to_string()
+}
+
+pub fn forward_public_name(agent_id: &str, name: &str) -> String {
+    format!("{agent_id}-{name}")
 }
 
 pub fn render_known_host_entry(relay_addr: &str, public_key: &PublicKey) -> Result<String> {
@@ -344,29 +362,33 @@ fn is_ssh_public_key_type(key_type: &str) -> bool {
 }
 
 fn parse_relay_addr(relay_addr: &str) -> Result<(String, u16)> {
-    let relay_addr = relay_addr.trim();
-    if let Some(rest) = relay_addr.strip_prefix('[') {
-        let Some((host, port)) = rest.split_once("]:") else {
-            bail!("relay_addr must be host:port or [ipv6]:port");
-        };
-        return Ok((host.to_string(), parse_port(port)?));
-    }
-
-    let Some((host, port)) = relay_addr.rsplit_once(':') else {
-        bail!("relay_addr must include a port");
-    };
-    if host.is_empty() {
-        bail!("relay_addr host cannot be empty");
-    }
-    if host.contains(':') {
-        bail!("relay_addr IPv6 hosts must use [host]:port");
-    }
-    Ok((host.to_string(), parse_port(port)?))
+    parse_host_port("relay_addr", relay_addr)
 }
 
-fn parse_port(port: &str) -> Result<u16> {
+fn parse_host_port(label: &str, value: &str) -> Result<(String, u16)> {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            bail!("{label} must be host:port or [ipv6]:port");
+        };
+        return Ok((host.to_string(), parse_port(label, port)?));
+    }
+
+    let Some((host, port)) = value.rsplit_once(':') else {
+        bail!("{label} must include a port");
+    };
+    if host.is_empty() {
+        bail!("{label} host cannot be empty");
+    }
+    if host.contains(':') {
+        bail!("{label} IPv6 hosts must use [host]:port");
+    }
+    Ok((host.to_string(), parse_port(label, port)?))
+}
+
+fn parse_port(label: &str, port: &str) -> Result<u16> {
     port.parse::<u16>()
-        .with_context(|| format!("invalid relay_addr port {port:?}"))
+        .with_context(|| format!("invalid {label} port {port:?}"))
 }
 
 fn known_host_pattern(host: &str, port: u16) -> String {
@@ -386,6 +408,17 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
     if !valid {
         bail!("{label} {value:?} may only contain ASCII letters, digits, '_' and '-'");
+    }
+    Ok(())
+}
+
+fn validate_forward_name(label: &str, value: &str) -> Result<()> {
+    validate_identifier(label, value)
+}
+
+fn validate_forward_port(label: &str, port: u32) -> Result<()> {
+    if port == 0 || port > u16::MAX as u32 {
+        bail!("{label} must be between 1 and 65535");
     }
     Ok(())
 }
@@ -421,7 +454,6 @@ allowed_agents = ["{}"]
 
 [agents.{}]
 agent_authorized_keys = ["{}"]
-forward_target = "127.0.0.1:22"
 "#,
             host_key, user_key, agent_id, agent_id, agent_key
         )
@@ -455,13 +487,13 @@ forward_target = "127.0.0.1:22"
     }
 
     #[test]
-    fn rejects_non_ssh_forward_target() {
+    fn rejects_relay_agent_forward_targets_field() {
         let raw = base_config("alice-home-linux").replace(
-            "forward_target = \"127.0.0.1:22\"",
-            "forward_target = \"127.0.0.1:8080\"",
+            "agent_authorized_keys = [",
+            "forward_targets = [{ name = \"ssh\", port = 22 }]\nagent_authorized_keys = [",
         );
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
-        assert!(err.to_string().contains("127.0.0.1:22"));
+        assert!(format!("{err:#}").contains("unknown field"));
     }
 
     #[test]
@@ -496,7 +528,9 @@ relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
 unexpected_field = true
 agent_id = "alice-home-linux"
 agent_private_key = '''PRIVATE_KEY'''
-forward_target = "127.0.0.1:22"
+forward_targets = [
+  { name = "ssh", port = 22, target = "127.0.0.1:22" }
+]
 "#
         .replace("RELAY_KEY", &relay_key)
         .replace("PRIVATE_KEY", &private_key_block());
@@ -521,10 +555,28 @@ target = "127.0.0.1:22"
     }
 
     #[test]
+    fn rejects_old_agent_forward_target_field() {
+        let relay_key = public_key_line();
+        let raw = r#"
+relay_addr = "relay.example.com:2222"
+relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
+agent_id = "alice-home-linux"
+agent_private_key = '''PRIVATE_KEY'''
+forward_targets = [
+  { name = "ssh", port = 22, forward_target = "127.0.0.1:22" }
+]
+"#
+        .replace("RELAY_KEY", &relay_key)
+        .replace("PRIVATE_KEY", &private_key_block());
+        let err = toml::from_str::<AgentConfig>(&raw).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown field"));
+    }
+
+    #[test]
     fn rejects_old_relay_agent_target_field() {
         let raw = base_config("alice-home-linux").replace(
-            "forward_target = \"127.0.0.1:22\"",
-            "target = \"127.0.0.1:22\"",
+            "agent_authorized_keys = [",
+            "target = \"127.0.0.1:22\"\nagent_authorized_keys = [",
         );
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
         assert!(format!("{err:#}").contains("unknown field"));
@@ -554,7 +606,9 @@ relay_addr = "relay.example.com:2222"
 relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
 agent_id = "mch_01"
 agent_private_key = '''PRIVATE_KEY'''
-forward_target = "127.0.0.1:22"
+forward_targets = [
+  { name = "ssh", port = 22, target = "127.0.0.1:22" }
+]
 reconnect_secs = 0
 "#
         .replace("RELAY_KEY", &relay_key)
@@ -572,7 +626,10 @@ relay_addr = "relay.example.com:2222"
 relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
 agent_id = "mch_01"
 agent_private_key = '''PRIVATE_KEY'''
-forward_target = "127.0.0.1:22"
+forward_targets = [
+  { name = "ssh", port = 22, target = "127.0.0.1:22" },
+  { name = "web", port = 8080, target = "127.0.0.1:8080" }
+]
 "#
         .replace("RELAY_KEY", &relay_key)
         .replace("PRIVATE_KEY", &private_key_block());
@@ -588,7 +645,9 @@ relay_addr = "relay.example.com:2222"
 relay_known_hosts = ["[other.example.com]:2222 RELAY_KEY"]
 agent_id = "mch_01"
 agent_private_key = '''PRIVATE_KEY'''
-forward_target = "127.0.0.1:22"
+forward_targets = [
+  { name = "ssh", port = 22, target = "127.0.0.1:22" }
+]
 "#
         .replace("RELAY_KEY", &relay_key)
         .replace("PRIVATE_KEY", &private_key_block());

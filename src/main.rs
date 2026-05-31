@@ -67,7 +67,7 @@ enum ConfigCommand {
         #[arg(
             long,
             default_value = "home-linux",
-            help = "Agent id used as relay-side SSH username and ProxyJump host"
+            help = "Agent id used as relay-side SSH username and public target prefix"
         )]
         agent_id: String,
         #[arg(
@@ -358,9 +358,10 @@ mod tests {
         let relay_raw = fs::read_to_string(&relay_output).unwrap();
         let relay: toml::Value = toml::from_str(&relay_raw).unwrap();
         assert_eq!(relay["relay"]["listen"].as_str(), Some("0.0.0.0:3333"));
-        assert_eq!(
-            relay["agents"]["alice-home-linux"]["forward_target"].as_str(),
-            Some("127.0.0.1:22")
+        assert!(
+            relay["agents"]["alice-home-linux"]
+                .get("forward_targets")
+                .is_none()
         );
         let relay_private_key = fs::read_to_string(&relay_private_key_output).unwrap();
         let relay_user_key = format!(
@@ -381,7 +382,12 @@ mod tests {
         let agent_raw = fs::read_to_string(&agent_output).unwrap();
         let agent: toml::Value = toml::from_str(&agent_raw).unwrap();
         assert_eq!(agent["relay_addr"].as_str(), Some("relay.example.com:3333"));
-        assert_eq!(agent["forward_target"].as_str(), Some("127.0.0.1:22"));
+        assert_eq!(agent["forward_targets"][0]["name"].as_str(), Some("ssh"));
+        assert_eq!(agent["forward_targets"][0]["port"].as_integer(), Some(22));
+        assert_eq!(
+            agent["forward_targets"][0]["target"].as_str(),
+            Some("127.0.0.1:22")
+        );
         let agent_private_key = agent["agent_private_key"].as_str().unwrap();
         let agent_public_key = parse_private_key(agent_private_key)
             .unwrap()

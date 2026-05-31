@@ -29,6 +29,16 @@ slay config init \
 
 `config init` writes `slay-relay.toml` and `slay-agent.toml`. `--relay-addr` is the SSH address used by the agent to connect back to the relay. `config init` uses the relay address port for the generated relay `[relay].listen` wildcard bind address. It generates the relay host key, the agent key, and the relay user key, embeds the role keys in the generated configs, writes the relay user public key into `authorized_keys`, and writes the agent public key into `agent_authorized_keys`. The generated relay user private key defaults to `slay-relay-<relay_user>.key`, for example `slay-relay-alice.key`; use it in your SSH client.
 
+`config init` creates one default forward target in `slay-agent.toml`:
+
+```toml
+forward_targets = [
+  { name = "ssh", port = 22, target = "127.0.0.1:22" }
+]
+```
+
+Add more entries to `slay-agent.toml` when the agent should expose more internal addresses. Client-facing target hosts are derived as `agent_id-name`, for example `alice-home-linux-ssh:22`. The relay does not statically list target names; it accepts runtime registrations from an authenticated agent under that agent's `agent_id-` prefix.
+
 Choose where the generated relay user key is written:
 
 ```bash
@@ -86,7 +96,7 @@ slay config init \
 - Confirm `relay_known_hosts` contains the relay address and SSH host public key.
 - Confirm `agent_id` matches the relay `[agents.<agent_id>]` entry.
 - Protect `slay-agent.toml`; `agent_private_key` contains the agent SSH private key.
-- Confirm `forward_target` points at the local SSH server behind the agent.
+- Confirm `forward_targets` maps each local service `name` and public `port` to the `target` address behind the agent.
 
 5. Validate both configs:
 
@@ -102,4 +112,4 @@ slay relay --config slay-relay.toml
 slay agent --config slay-agent.toml
 ```
 
-The agent connects to the relay over SSH, authenticates as `agent_id`, and registers reverse forwarding for `agent_id:22`. User SSH clients still connect to the relay and request `direct-tcpip` to the agent id through `ProxyJump`.
+The agent connects to the relay over SSH, authenticates as `agent_id`, and registers reverse forwarding for each configured `forward_targets` entry as `agent_id-name:port`. User SSH clients still connect to the relay and request `direct-tcpip` to that derived target through `ProxyJump` or an equivalent jump-host feature.

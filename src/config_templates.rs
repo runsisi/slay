@@ -39,7 +39,6 @@ allowed_agents = [
 agent_authorized_keys = [
 {agent_authorized_keys}
 ]
-forward_target = "127.0.0.1:22"
 "#,
     )
 }
@@ -59,7 +58,9 @@ relay_known_hosts = [
 
 agent_id = {agent_id}
 agent_private_key = {agent_private_key}
-forward_target = "127.0.0.1:22"
+forward_targets = [
+  {{ name = "ssh", port = 22, target = "127.0.0.1:22" }}
+]
 reconnect_secs = 5
 "#,
     )

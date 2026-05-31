@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -17,6 +17,7 @@ use crate::config::RelayConfig;
 pub struct RelayState {
     config: RelayConfig,
     online_agents: Arc<RwLock<HashMap<String, AgentHandle>>>,
+    forward_routes: Arc<RwLock<HashMap<(String, u32), ForwardRegistration>>>,
     next_connection_id: Arc<AtomicU64>,
 }
 
@@ -24,6 +25,18 @@ pub struct RelayState {
 struct AgentHandle {
     connection_id: u64,
     ssh: server::Handle,
+}
+
+#[derive(Clone, Debug)]
+struct ForwardRegistration {
+    agent_id: String,
+    connection_id: u64,
+}
+
+impl ForwardRegistration {
+    fn matches(&self, registration: &AgentRegistration) -> bool {
+        self.agent_id == registration.agent_id && self.connection_id == registration.connection_id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -40,8 +53,8 @@ enum AuthRole {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RelayRouteError {
-    #[error("unknown agent id {0}")]
-    UnknownAgent(String),
+    #[error("unknown forward target {public_name}:{port}")]
+    UnknownForward { public_name: String, port: u32 },
     #[error("user {user} is not allowed to access {agent_id}")]
     Unauthorized { user: String, agent_id: String },
     #[error("agent {0} is offline")]
@@ -55,6 +68,7 @@ impl RelayState {
         Self {
             config,
             online_agents: Arc::new(RwLock::new(HashMap::new())),
+            forward_routes: Arc::new(RwLock::new(HashMap::new())),
             next_connection_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -73,6 +87,10 @@ impl RelayState {
             .write()
             .await
             .insert(agent_id.to_string(), handle);
+        self.forward_routes
+            .write()
+            .await
+            .retain(|_, forward| forward.agent_id != agent_id);
         Ok(AgentRegistration {
             agent_id: agent_id.to_string(),
             connection_id,
@@ -80,50 +98,101 @@ impl RelayState {
     }
 
     async fn unregister_agent(&self, registration: &AgentRegistration) {
-        let mut online = self.online_agents.write().await;
-        if online
-            .get(&registration.agent_id)
-            .is_some_and(|current| current.connection_id == registration.connection_id)
         {
-            online.remove(&registration.agent_id);
+            let mut online = self.online_agents.write().await;
+            if online
+                .get(&registration.agent_id)
+                .is_some_and(|current| current.connection_id == registration.connection_id)
+            {
+                online.remove(&registration.agent_id);
+            }
+        }
+        self.forward_routes
+            .write()
+            .await
+            .retain(|_, forward| !forward.matches(registration));
+    }
+
+    async fn register_agent_forward(
+        &self,
+        registration: &AgentRegistration,
+        public_name: &str,
+        port: u32,
+    ) -> bool {
+        if public_forward_name_for_agent(&registration.agent_id, public_name).is_none()
+            || !valid_forward_port(port)
+        {
+            return false;
+        }
+
+        let route = (public_name.to_string(), port);
+        let mut routes = self.forward_routes.write().await;
+        if routes.contains_key(&route) {
+            return false;
+        }
+        routes.insert(
+            route,
+            ForwardRegistration {
+                agent_id: registration.agent_id.clone(),
+                connection_id: registration.connection_id,
+            },
+        );
+        true
+    }
+
+    async fn unregister_agent_forward(
+        &self,
+        registration: &AgentRegistration,
+        public_name: &str,
+        port: u32,
+    ) {
+        let route = (public_name.to_string(), port);
+        let mut routes = self.forward_routes.write().await;
+        if routes
+            .get(&route)
+            .is_some_and(|forward| forward.matches(registration))
+        {
+            routes.remove(&route);
         }
     }
 
     pub async fn open_agent_channel(
         &self,
         user: &str,
-        agent_id: &str,
+        public_name: &str,
         port: u32,
         originator_address: &str,
         originator_port: u32,
     ) -> Result<Channel<Msg>, RelayRouteError> {
-        if port != 22 {
-            return Err(RelayRouteError::AgentChannel(format!(
-                "port {port} is not allowed"
-            )));
-        }
-
-        self.config
-            .agent_by_id(agent_id)
-            .ok_or_else(|| RelayRouteError::UnknownAgent(agent_id.to_string()))?;
-        if !self.config.user_can_access(user, agent_id) {
+        let forward = self
+            .forward_routes
+            .read()
+            .await
+            .get(&(public_name.to_string(), port))
+            .cloned()
+            .ok_or_else(|| RelayRouteError::UnknownForward {
+                public_name: public_name.to_string(),
+                port,
+            })?;
+        if !self.config.user_can_access(user, &forward.agent_id) {
             return Err(RelayRouteError::Unauthorized {
                 user: user.to_string(),
-                agent_id: agent_id.to_string(),
+                agent_id: forward.agent_id.to_string(),
             });
         }
 
         let ssh = {
             let online = self.online_agents.read().await;
             online
-                .get(agent_id)
+                .get(&forward.agent_id)
+                .filter(|agent| agent.connection_id == forward.connection_id)
                 .map(|agent| agent.ssh.clone())
-                .ok_or_else(|| RelayRouteError::Offline(agent_id.to_string()))?
+                .ok_or_else(|| RelayRouteError::Offline(forward.agent_id.to_string()))?
         };
 
         ssh.channel_open_forwarded_tcpip(
-            agent_id.to_string(),
-            22,
+            public_name.to_string(),
+            port,
             originator_address.to_string(),
             originator_port,
         )
@@ -168,6 +237,7 @@ impl server::Server for SshRelayServer {
             state: self.state.clone(),
             auth_role: None,
             agent_registration: None,
+            agent_forwards: HashSet::new(),
             peer_addr,
         }
     }
@@ -181,6 +251,7 @@ struct SshRelaySession {
     state: RelayState,
     auth_role: Option<AuthRole>,
     agent_registration: Option<AgentRegistration>,
+    agent_forwards: HashSet<(String, u32)>,
     peer_addr: Option<std::net::SocketAddr>,
 }
 
@@ -194,6 +265,23 @@ impl SshRelaySession {
         }
         None
     }
+}
+
+fn public_forward_name_for_agent<'a>(agent_id: &str, public_name: &'a str) -> Option<&'a str> {
+    let prefix = format!("{agent_id}-");
+    let name = public_name.strip_prefix(&prefix)?;
+    valid_forward_name(name).then_some(name)
+}
+
+fn valid_forward_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn valid_forward_port(port: u32) -> bool {
+    port > 0 && port <= u16::MAX as u32
 }
 
 impl Drop for SshRelaySession {
@@ -279,7 +367,9 @@ impl server::Handler for SshRelaySession {
             warn!(peer = ?self.peer_addr, "tcpip-forward rejected for non-agent session");
             return Ok(false);
         };
-        if address != agent_id || *port != 22 {
+        let agent_id = agent_id.clone();
+        if public_forward_name_for_agent(&agent_id, address).is_none() || !valid_forward_port(*port)
+        {
             warn!(
                 agent_id,
                 requested_address = address,
@@ -288,21 +378,54 @@ impl server::Handler for SshRelaySession {
             );
             return Ok(false);
         }
-        if self.agent_registration.is_some() {
-            warn!(agent_id, "duplicate agent tcpip-forward rejected");
+        let route = (address.to_string(), *port);
+        if self.agent_forwards.contains(&route) {
+            warn!(
+                agent_id,
+                requested_address = address,
+                requested_port = *port,
+                "duplicate agent tcpip-forward rejected"
+            );
             return Ok(false);
         }
 
+        if self.agent_registration.is_none() {
+            let registration = self
+                .state
+                .register_agent(&agent_id, session.handle())
+                .await?;
+            info!(
+                agent_id = %registration.agent_id,
+                connection_id = registration.connection_id,
+                "agent registered"
+            );
+            self.agent_registration = Some(registration);
+        }
         let registration = self
+            .agent_registration
+            .as_ref()
+            .expect("agent is registered");
+        if !self
             .state
-            .register_agent(agent_id, session.handle())
-            .await?;
+            .register_agent_forward(registration, address, *port)
+            .await
+        {
+            warn!(
+                agent_id,
+                requested_address = address,
+                requested_port = *port,
+                "agent tcpip-forward collided with an active forward"
+            );
+            return Ok(false);
+        }
+        self.agent_forwards.insert(route);
         info!(
             agent_id = %registration.agent_id,
             connection_id = registration.connection_id,
+            public_name = address,
+            forward_port = *port,
             "agent registered SSH reverse forwarding"
         );
-        self.agent_registration = Some(registration);
         Ok(true)
     }
 
@@ -312,19 +435,32 @@ impl server::Handler for SshRelaySession {
         port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let Some(registration) = self.agent_registration.take() else {
+        let Some(registration) = self.agent_registration.as_ref() else {
             return Ok(false);
         };
-        if registration.agent_id != address || port != 22 {
-            self.agent_registration = Some(registration);
+        if !self.agent_forwards.remove(&(address.to_string(), port)) {
             return Ok(false);
         }
-        self.state.unregister_agent(&registration).await;
+        let registration = registration.clone();
+        self.state
+            .unregister_agent_forward(&registration, address, port)
+            .await;
         info!(
             agent_id = %registration.agent_id,
             connection_id = registration.connection_id,
+            public_name = address,
+            forward_port = port,
             "agent cancelled SSH reverse forwarding"
         );
+        if self.agent_forwards.is_empty() {
+            self.agent_registration = None;
+            self.state.unregister_agent(&registration).await;
+            info!(
+                agent_id = %registration.agent_id,
+                connection_id = registration.connection_id,
+                "agent unregistered"
+            );
+        }
         Ok(true)
     }
 
@@ -357,7 +493,7 @@ impl server::Handler for SshRelaySession {
 
         debug!(
             user,
-            agent_id = host_to_connect,
+            public_name = host_to_connect,
             port = port_to_connect,
             originator_address,
             originator_port,
@@ -379,7 +515,7 @@ impl server::Handler for SshRelaySession {
             Err(err) => {
                 warn!(
                     user,
-                    agent_id = host_to_connect,
+                    public_name = host_to_connect,
                     port = port_to_connect,
                     error = %err,
                     "direct-tcpip rejected"
@@ -388,10 +524,10 @@ impl server::Handler for SshRelaySession {
             }
         };
 
-        let agent_id = host_to_connect.to_string();
+        let public_name = host_to_connect.to_string();
         tokio::spawn(async move {
             if let Err(err) = relay_user_channel_to_agent(channel, agent_channel).await {
-                debug!(agent_id, error = %err, "relay stream ended");
+                debug!(public_name, error = %err, "relay stream ended");
             }
         });
         Ok(true)
@@ -496,21 +632,35 @@ allowed_agents = ["alice-home-linux"]
 
 [agents.alice-home-linux]
 agent_authorized_keys = ["{agent_key_a}"]
-forward_target = "127.0.0.1:22"
 
 [agents.bob-home-linux]
 agent_authorized_keys = ["{agent_key_b}"]
-forward_target = "127.0.0.1:22"
 "#
         );
         RelayConfig::from_toml_str(&raw).unwrap()
     }
 
+    async fn insert_forward_route(
+        state: &RelayState,
+        public_name: &str,
+        port: u32,
+        agent_id: &str,
+    ) {
+        state.forward_routes.write().await.insert(
+            (public_name.to_string(), port),
+            ForwardRegistration {
+                agent_id: agent_id.to_string(),
+                connection_id: 1,
+            },
+        );
+    }
+
     #[tokio::test]
     async fn denies_unauthorized_agent_channel() {
         let state = RelayState::new(relay_config());
+        insert_forward_route(&state, "bob-home-linux-ssh", 22, "bob-home-linux").await;
         let err = state
-            .open_agent_channel("alice", "bob-home-linux", 22, "127.0.0.1", 5555)
+            .open_agent_channel("alice", "bob-home-linux-ssh", 22, "127.0.0.1", 5555)
             .await
             .unwrap_err();
         assert!(matches!(err, RelayRouteError::Unauthorized { .. }));
@@ -519,10 +669,37 @@ forward_target = "127.0.0.1:22"
     #[tokio::test]
     async fn authorized_agent_must_be_online() {
         let state = RelayState::new(relay_config());
+        insert_forward_route(&state, "alice-home-linux-web", 8080, "alice-home-linux").await;
         let err = state
-            .open_agent_channel("alice", "alice-home-linux", 22, "127.0.0.1", 5555)
+            .open_agent_channel("alice", "alice-home-linux-web", 8080, "127.0.0.1", 5555)
             .await
             .unwrap_err();
         assert!(matches!(err, RelayRouteError::Offline(_)));
+    }
+
+    #[tokio::test]
+    async fn unregistered_forward_is_unknown() {
+        let state = RelayState::new(relay_config());
+        let err = state
+            .open_agent_channel("alice", "alice-home-linux-web", 8080, "127.0.0.1", 5555)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelayRouteError::UnknownForward { .. }));
+    }
+
+    #[test]
+    fn public_forward_name_must_belong_to_agent_namespace() {
+        assert_eq!(
+            public_forward_name_for_agent("alice-home-linux", "alice-home-linux-ssh"),
+            Some("ssh")
+        );
+        assert_eq!(
+            public_forward_name_for_agent("alice-home-linux", "bob-home-linux-ssh"),
+            None
+        );
+        assert_eq!(
+            public_forward_name_for_agent("alice-home-linux", "alice-home-linux-"),
+            None
+        );
     }
 }

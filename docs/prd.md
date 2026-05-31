@@ -56,7 +56,7 @@
 PC sshd: 127.0.0.1:22
 ```
 
-用户侧通过 `ProxyJump` 让 SSH 客户端先登录 relay，再向 relay 发起 `direct-tcpip` 到 `agent_id:22`。agent 侧以 `agent_id` 作为 SSH 用户名登录 relay，认证成功后请求 `tcpip-forward agent_id:22`。relay 收到用户请求时，向对应 agent 打开 `forwarded-tcpip` channel，agent 再连接本机 `127.0.0.1:22`。
+用户侧通过 `ProxyJump` 让 SSH 客户端先登录 relay，再向 relay 发起 `direct-tcpip` 到派生出来的公开目标 `agent_id-name:port`。agent 侧以 `agent_id` 作为 SSH 用户名登录 relay，认证成功后为每个 `forward_targets` 条目请求 `tcpip-forward agent_id-name:port`。relay 收到用户请求时，按 agent 已注册的 `agent_id-name:port` 找到对应 agent 并打开 `forwarded-tcpip` channel，agent 再连接该条目配置的本机或内网 `target`。
 
 ## 最终设计决策
 
@@ -65,11 +65,12 @@ MVP 固定采用以下决策：
 - relay 用户认证只支持 SSH 公钥认证，不支持密码登录。
 - agent 到 relay 的认证也使用 SSH 公钥认证，不引入自定义 token。
 - agent 到 relay 的链路使用 SSH 加密和 SSH host key 校验，不引入单独 TLS。
-- 每台 PC 使用全局唯一、可读的 `agent_id` 作为 agent SSH 用户名和用户侧目标 host。
+- 每台 PC 使用全局唯一、可读的 `agent_id` 作为 agent SSH 用户名；用户侧目标 host 使用 `agent_id-<name>`。
+- 公开目标名使用中划线拼接 `agent_id` 和 target `name`，不使用冒号，避免和 `host:port`、IPv6、scp 语法混淆。
 - relay 侧为每个 agent 配置 `agent_authorized_keys`。
 - agent 侧配置内嵌 `agent_private_key` 和 `relay_known_hosts`。
-- 手机 SSH 客户端使用 `agent_id` 作为 Jump Host 目标 host。
-- MVP 只支持转发到 PC 本机 sshd，即 `127.0.0.1:22`。
+- 手机 SSH 客户端使用 `agent_id-name` 作为 Jump Host 后面的目标 host。
+- 每个 agent 可配置多个 `forward_targets`，分别映射到本机或内网的不同地址。
 - relay 只支持 `direct-tcpip` 和 agent remote forwarding 所需能力，不提供可交互 shell。
 
 ## 认证模型
@@ -127,17 +128,16 @@ id_pc:          只允许用户登录 PC
 
 不能使用 PC 的真实 hostname 作为唯一标识，因为多台 PC 可能 hostname 相同。
 
-每台 PC 配置一个给 SSH 客户端和 agent 共同使用的可读 `agent_id`。relay 侧不再单独配置 `agent_id` 字段，`[agents.<agent_id>]` 的表键就是 agent id：
+每台 PC 配置一个给 agent 登录 relay 使用的可读 `agent_id`。relay 侧不再单独配置 `agent_id` 字段，`[agents.<agent_id>]` 的表键就是 agent id：
 
 ```toml
 [agents.alice-home-linux]
 agent_authorized_keys = [
   "ssh-ed25519 AAAA... alice-home-agent"
 ]
-forward_target = "127.0.0.1:22"
 ```
 
-agent 自己的配置中保留同一个 `agent_id`，用于登录 relay 和注册 `tcpip-forward`。
+agent 自己的配置中保留同一个 `agent_id`，用于登录 relay。`forward_targets[].name` 是 agent 内部的局部服务名；用户 SSH client 请求的目标 host 是 `agent_id-name`，例如 `alice-home-linux-ssh`。relay 侧不重复配置 target 列表，只校验 agent key、agent id 前缀和用户到 agent 的 allowlist。
 
 命名建议：
 
@@ -157,7 +157,7 @@ alice-office-linux -> agent SSH connection B
 bob-home-linux     -> agent SSH connection C
 ```
 
-手机 SSH 客户端里的目标 host 字段使用 `agent_id`，例如 `alice-home-linux`。relay 收到 jump host 的 `direct-tcpip` 请求后，将目标 host 当作 `agent_id` 查找在线 agent，而不是做 DNS 解析。
+手机 SSH 客户端里的目标 host 字段使用派生公开名，例如 `alice-home-linux-ssh` 或 `alice-home-linux-web`。relay 收到 jump host 的 `direct-tcpip` 请求后，将目标 `agent_id-name:port` 当作 agent 已注册的 runtime route 查找在线 agent，而不是做 DNS 解析。
 
 ## 用户连接体验
 
@@ -177,7 +177,7 @@ Host relay
   IdentityFile ~/.ssh/id_relay_user
 
 Host home-pc
-  HostName alice-home-linux
+  HostName alice-home-linux-ssh
   Port 22
   User pcuser
   IdentityFile ~/.ssh/id_pc
@@ -190,14 +190,14 @@ Host home-pc
 1. slay agent 连接 relay.example.com:2222。
 2. agent 校验 relay SSH host key。
 3. agent 以 alice-home-linux 作为 SSH 用户名，用 agent 私钥认证。
-4. agent 请求 tcpip-forward alice-home-linux:22。
+4. agent 为每个 forward target 请求 tcpip-forward，例如 alice-home-linux-ssh:22。
 5. 手机 SSH 客户端连接 relay.example.com:2222。
 6. relay 验证 alice 的公钥。
-7. 客户端通过 relay 请求连接 alice-home-linux:22。
+7. 客户端通过 relay 请求连接 alice-home-linux-ssh:22。
 8. relay 检查 alice 是否有权限访问 alice-home-linux。
 9. relay 找到已在线的 alice-home-linux agent。
 10. relay 向 agent 打开 forwarded-tcpip channel。
-11. agent 连接本机 127.0.0.1:22。
+11. agent 按 alice-home-linux-ssh:22 对应的 target 连接本机或内网目标，例如 127.0.0.1:22。
 12. relay 在用户 SSH channel 和 agent SSH channel 之间双向转发字节。
 13. 手机 SSH 客户端与 PC sshd 完成标准 SSH 登录。
 ```
@@ -224,7 +224,7 @@ relay 作为标准 SSH server 暴露给用户 SSH 客户端，同时接收 agent
 - 用户侧 `direct-tcpip` channel。
 - agent 侧 `tcpip-forward` global request。
 - relay 到 agent 的 `forwarded-tcpip` channel。
-- 根据 `direct-tcpip` 的目标 host 字段解析 `agent_id`。
+- 根据 agent 注册的 `agent_id-name:port` runtime route 解析所属 agent。
 - 用户到 agent 的 ACL 校验。
 - agent 注册和下线清理。
 - 同一个 agent 上多个并发 SSH 会话。
@@ -236,8 +236,8 @@ relay 作为标准 SSH server 暴露给用户 SSH 客户端，同时接收 agent
 - exec command。
 - scp/sftp 子系统。
 - 未授权的端口转发。
-- 非 `127.0.0.1:22` 的目标服务转发。
-- agent 注册非自身 `agent_id:22` 的 remote forward。
+- 未注册的目标服务转发。
+- agent 注册不属于自身 `agent_id-` 前缀的 remote forward。
 
 ## PC Agent 行为
 
@@ -247,9 +247,9 @@ relay 作为标准 SSH server 暴露给用户 SSH 客户端，同时接收 agent
 
 - 校验 relay SSH host key。
 - 使用 agent 私钥向 relay 认证。
-- 以 `agent_id:22` 注册 SSH remote forwarding。
+- 为每个 `forward_targets` 条目注册 SSH remote forwarding。
 - 接收 relay 打开的 `forwarded-tcpip` channel。
-- 对每个请求连接本机目标 `127.0.0.1:22`。
+- 对每个请求连接该 `agent_id-name:port` 对应的本机或内网 `target`。
 - 在 relay SSH channel 与本地 TCP stream 之间做双向 copy。
 - 支持多个并发转发流。
 - 网络断开后自动重连。
@@ -280,13 +280,11 @@ allowed_agents = [
 agent_authorized_keys = [
   "ssh-ed25519 BBBB... alice-home-agent"
 ]
-forward_target = "127.0.0.1:22"
 
 [agents.alice-office-linux]
 agent_authorized_keys = [
   "ssh-ed25519 CCCC... alice-office-agent"
 ]
-forward_target = "127.0.0.1:22"
 ```
 
 agent 配置示例：
@@ -302,7 +300,10 @@ agent_private_key = '''
 ...
 -----END OPENSSH PRIVATE KEY-----
 '''
-forward_target = "127.0.0.1:22"
+forward_targets = [
+  { name = "ssh", port = 22, target = "127.0.0.1:22" },
+  { name = "web", port = 8080, target = "127.0.0.1:8080" }
+]
 reconnect_secs = 5
 ```
 
@@ -328,9 +329,9 @@ reconnect_secs = 5
 - agent SSH 公钥认证。
 - `[agents.<agent_id>]` 配置加载和唯一性校验。
 - agent 在线状态管理。
-- `direct-tcpip` 到 agent 的路由。
+- `direct-tcpip` 到已注册 forward target 所属 agent 的路由。
 - relay 到 agent 的 `forwarded-tcpip` channel。
-- agent 到本机 `127.0.0.1:22` 的 TCP 转发。
+- agent 到本机或内网 `target` 的 TCP 转发。
 - 基于配置文件的 ACL。
 - 基础日志和错误处理。
 
@@ -355,7 +356,7 @@ reconnect_secs = 5
 - 每个 agent 使用独立 agent SSH key。
 - relay 只保存 agent public key，不保存 agent private key。
 - 每个 relay 用户配置可访问的 agent allowlist。
-- agent 只能注册配置中允许的自身 `agent_id:22`。
+- agent 只能注册自身 `agent_id-` 前缀下的 `<name>:port`。
 - `agent_id` 必须全局唯一，且不能和 relay 用户名冲突。
 - 日志不能记录 SSH payload、私钥或用户密码。
 - 需要对认证失败、未知 agent、ACL 拒绝和 agent 断开进行审计日志记录。

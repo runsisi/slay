@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use russh::keys::key::PrivateKeyWithHashAlg;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::config::{AgentConfig, fingerprint, parse_private_key};
+use crate::config::{AgentConfig, fingerprint, forward_public_name, parse_private_key};
 
 pub async fn run_agent(config: AgentConfig) -> Result<()> {
     loop {
@@ -34,7 +34,19 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
     let handler = AgentSshClient {
         expected_relay_known_host_fingerprints,
         agent_id: config.agent_id.clone(),
-        forward_target: config.forward_target.clone(),
+        forward_targets: config
+            .forward_targets
+            .iter()
+            .map(|target| {
+                (
+                    (
+                        forward_public_name(&config.agent_id, &target.name),
+                        target.port,
+                    ),
+                    target.target.clone(),
+                )
+            })
+            .collect(),
     };
 
     let mut session = client::connect(client_config, config.relay_addr.as_str(), handler)
@@ -52,15 +64,26 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
         bail!("relay rejected agent SSH public key authentication");
     }
 
-    session
-        .tcpip_forward(config.agent_id.clone(), 22)
-        .await
-        .context("relay rejected agent reverse forwarding request")?;
-    info!(
-        agent_id = %config.agent_id,
-        forward_target = %config.forward_target,
-        "agent registered SSH reverse forwarding"
-    );
+    for target in &config.forward_targets {
+        let public_name = forward_public_name(&config.agent_id, &target.name);
+        session
+            .tcpip_forward(public_name.clone(), target.port)
+            .await
+            .with_context(|| {
+                format!(
+                    "relay rejected agent reverse forwarding request for {}:{}",
+                    public_name, target.port
+                )
+            })?;
+        info!(
+            agent_id = %config.agent_id,
+            public_name = %public_name,
+            forward_name = %target.name,
+            forward_port = target.port,
+            target = %target.target,
+            "agent registered SSH reverse forwarding"
+        );
+    }
 
     session.await.context("agent SSH session ended")
 }
@@ -68,7 +91,7 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
 struct AgentSshClient {
     expected_relay_known_host_fingerprints: HashSet<String>,
     agent_id: String,
-    forward_target: String,
+    forward_targets: HashMap<(String, u32), String>,
 }
 
 impl client::Handler for AgentSshClient {
@@ -92,19 +115,26 @@ impl client::Handler for AgentSshClient {
         originator_port: u32,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        if connected_address != self.agent_id || connected_port != 22 {
+        let Some(target) = self
+            .forward_targets
+            .get(&(connected_address.to_string(), connected_port))
+        else {
             bail!(
                 "relay opened unexpected forwarded channel to {connected_address}:{connected_port}"
             );
-        }
+        };
 
-        let forward_target = self.forward_target.clone();
+        let target = target.clone();
         let agent_id = self.agent_id.clone();
+        let public_name = connected_address.to_string();
+        let forward_port = connected_port;
         let originator_address = originator_address.to_string();
         tokio::spawn(async move {
-            if let Err(err) = forward_channel_to_target(channel, &forward_target).await {
+            if let Err(err) = forward_channel_to_target(channel, &target).await {
                 debug!(
                     agent_id,
+                    public_name,
+                    forward_port,
                     originator_address,
                     originator_port,
                     error = %err,
