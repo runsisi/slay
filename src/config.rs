@@ -278,6 +278,16 @@ pub fn render_known_host_entry(relay_addr: &str, public_key: &PublicKey) -> Resu
     ))
 }
 
+pub fn relay_listen_for_addr(relay_addr: &str) -> Result<String> {
+    let (host, port) = parse_relay_addr(relay_addr)?;
+    let listen_host = if host.contains(':') {
+        "[::]"
+    } else {
+        "0.0.0.0"
+    };
+    Ok(format!("{listen_host}:{port}"))
+}
+
 fn known_host_fingerprints_for_addr(
     relay_addr: &str,
     known_hosts: &[String],
@@ -558,6 +568,18 @@ target = "127.0.0.1:22"
         let config: AgentConfig = toml::from_str(&raw).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("relay_known_hosts"));
+    }
+
+    #[test]
+    fn derives_relay_listen_port_from_relay_addr() {
+        assert_eq!(
+            relay_listen_for_addr("relay.example.com:3333").unwrap(),
+            "0.0.0.0:3333"
+        );
+        assert_eq!(
+            relay_listen_for_addr("[2001:db8::10]:4444").unwrap(),
+            "[::]:4444"
+        );
     }
 
     #[test]

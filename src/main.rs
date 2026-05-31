@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand};
 use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 use slay::agent::run_agent;
 use slay::config::{
-    AgentConfig, RelayConfig, parse_private_key, parse_public_key, render_known_host_entry,
+    AgentConfig, RelayConfig, parse_private_key, parse_public_key, relay_listen_for_addr,
+    render_known_host_entry,
 };
 use slay::config_templates::{
     AGENT_CONFIG_TEMPLATE, PairTemplateInput, RELAY_CONFIG_TEMPLATE, render_agent_config,
@@ -38,11 +39,12 @@ enum Command {
     #[command(about = "Create and validate configuration")]
     Config {
         #[command(subcommand)]
-        command: ConfigCommand,
+        command: Box<ConfigCommand>,
     },
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum ConfigCommand {
     #[command(about = "Create matching relay and agent configs")]
     Init {
@@ -126,7 +128,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Relay { config } => run_relay_server(RelayConfig::from_path(config)?).await,
         Command::Agent { config } => run_agent(AgentConfig::from_path(config)?).await,
-        Command::Config { command } => handle_config_command(command),
+        Command::Config { command } => handle_config_command(*command),
     }
 }
 
@@ -254,6 +256,7 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
 
     let host_key = read_or_generate_private_key("relay host key", options.host_key)?;
     let host_private_key = parse_private_key(&host_key).context("invalid relay host key")?;
+    let relay_listen = relay_listen_for_addr(options.relay_addr)?;
     let relay_known_hosts = vec![render_known_host_entry(
         options.relay_addr,
         host_private_key.public_key(),
@@ -262,6 +265,7 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
         relay_user: options.relay_user,
         relay_authorized_keys: &relay_authorized_keys,
         agent_authorized_keys: &agent_authorized_keys,
+        relay_listen: &relay_listen,
         relay_addr: options.relay_addr,
         host_key: &host_key,
         relay_known_hosts: &relay_known_hosts,
@@ -417,6 +421,7 @@ fn ensure_can_write(output: &Path, force: bool) -> Result<()> {
 mod tests {
     use super::*;
     use russh::keys::{Algorithm, PrivateKey};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn public_key_line(comment: &str) -> String {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -433,5 +438,44 @@ mod tests {
                 .unwrap();
 
         assert_eq!(parsed, vec![key_a, key_b]);
+    }
+
+    #[test]
+    fn init_derives_relay_listen_from_relay_addr_port() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("slay-config-init-{unique}-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let relay_output = dir.join("relay.toml");
+        let agent_output = dir.join("agent.toml");
+
+        write_pair_templates(PairInitOptions {
+            relay_output: &relay_output,
+            agent_output: &agent_output,
+            relay_addr: "relay.example.com:3333",
+            agent_id: "alice-home-linux",
+            relay_user: "alice",
+            relay_authorized_keys: &[],
+            relay_authorized_key_files: &[],
+            agent_authorized_keys: &[],
+            agent_authorized_key_files: &[],
+            host_key: None,
+            agent_key: None,
+            force: false,
+        })
+        .unwrap();
+
+        let relay_raw = fs::read_to_string(&relay_output).unwrap();
+        let relay: toml::Value = toml::from_str(&relay_raw).unwrap();
+        assert_eq!(relay["server"]["listen"].as_str(), Some("0.0.0.0:3333"));
+
+        let agent_raw = fs::read_to_string(&agent_output).unwrap();
+        let agent: toml::Value = toml::from_str(&agent_raw).unwrap();
+        assert_eq!(agent["relay_addr"].as_str(), Some("relay.example.com:3333"));
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

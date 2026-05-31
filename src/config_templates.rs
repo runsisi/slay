@@ -46,6 +46,7 @@ pub struct PairTemplateInput<'a> {
     pub relay_user: &'a str,
     pub relay_authorized_keys: &'a [String],
     pub agent_authorized_keys: &'a [String],
+    pub relay_listen: &'a str,
     pub relay_addr: &'a str,
     pub host_key: &'a str,
     pub relay_known_hosts: &'a [String],
@@ -57,6 +58,7 @@ pub fn render_relay_config(input: &PairTemplateInput<'_>) -> String {
     let relay_user = input.relay_user;
     let relay_authorized_keys = render_toml_array_items(input.relay_authorized_keys);
     let agent_authorized_keys = render_toml_array_items(input.agent_authorized_keys);
+    let relay_listen = toml_string(input.relay_listen);
     let host_key = toml_multiline_literal(input.host_key);
     let agent_id = toml_string(input.agent_id);
     let agent_table_key = input.agent_id;
@@ -64,7 +66,7 @@ pub fn render_relay_config(input: &PairTemplateInput<'_>) -> String {
         r#"# slay relay config
 
 [server]
-listen = "0.0.0.0:2222"
+listen = {relay_listen}
 host_key = {host_key}
 
 [users.{relay_user}]
@@ -147,6 +149,7 @@ mod tests {
             relay_user: "alice",
             relay_authorized_keys: &relay_authorized_keys,
             agent_authorized_keys: &agent_authorized_keys,
+            relay_listen: "0.0.0.0:2222",
             relay_addr: "relay.example.com:2222",
             host_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nCCCC\n-----END OPENSSH PRIVATE KEY-----\n",
             relay_known_hosts: &relay_known_hosts,
@@ -170,6 +173,7 @@ mod tests {
             relay_user: "alice",
             relay_authorized_keys: &relay_authorized_keys,
             agent_authorized_keys: &agent_authorized_keys,
+            relay_listen: "0.0.0.0:2222",
             relay_addr: "relay.example.com:2222",
             host_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nDDDD\n-----END OPENSSH PRIVATE KEY-----\n",
             relay_known_hosts: &relay_known_hosts,

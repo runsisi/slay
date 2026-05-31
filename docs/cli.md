@@ -30,7 +30,7 @@ slay config init \
   --agent-id alice-home-linux
 ```
 
-`--relay-addr` is the SSH address used by the agent to connect back to the relay. `config init` generates both the relay host key and the agent key by default, embeds the private keys in the generated configs, and writes the matching public keys into `relay_known_hosts` and `agent_authorized_keys`.
+`--relay-addr` is the SSH address used by the agent to connect back to the relay. `config init` uses its port for the generated relay `[server].listen` wildcard bind address. It generates both the relay host key and the agent key by default, embeds the private keys in the generated configs, and writes the matching public keys into `relay_known_hosts` and `agent_authorized_keys`.
 
 Embed existing relay or agent private keys instead of generating them:
 
