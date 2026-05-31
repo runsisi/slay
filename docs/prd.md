@@ -322,7 +322,7 @@ reconnect_secs = 5
 - `slay` 二进制。
 - `slay relay` 子命令。
 - `slay agent` 子命令。
-- `slay config init` 一次生成匹配的 relay/agent 配置；未输入 relay 用户 authorized keys 时自动生成 relay 用户 key pair，并写入 relay 用户 authorized keys、agent authorized keys、relay host key 和 agent private key。
+- `slay config init` 一次生成匹配的 relay/agent 配置；自动生成 relay 用户 key pair、agent private key 和 relay host key，并写入 relay 用户 authorized keys 和 agent authorized keys。
 - `slay config validate` 校验 relay/agent 配置。
 - relay 用户 SSH 公钥认证。
 - agent SSH 公钥认证。

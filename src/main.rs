@@ -8,11 +8,13 @@ use clap::{Parser, Subcommand};
 use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 use slay::agent::run_agent;
 use slay::config::{
-    AgentConfig, RelayConfig, parse_private_key, parse_public_key, relay_listen_for_addr,
-    render_known_host_entry,
+    AgentConfig, RelayConfig, parse_private_key, relay_listen_for_addr, render_known_host_entry,
 };
 use slay::config_templates::{PairTemplateInput, render_agent_config, render_relay_config};
 use slay::relay::run_relay_server;
+
+const INIT_RELAY_CONFIG_OUTPUT: &str = "slay-relay.toml";
+const INIT_AGENT_CONFIG_OUTPUT: &str = "slay-agent.toml";
 
 #[derive(Debug, Parser)]
 #[command(version, about = "SSH relay for agents behind NAT")]
@@ -45,35 +47,34 @@ enum Command {
 enum ConfigCommand {
     #[command(about = "Create matching relay and agent configs")]
     Init {
-        #[arg(long, default_value = "slay-relay.toml")]
-        relay_output: PathBuf,
-        #[arg(long, default_value = "slay-agent.toml")]
-        agent_output: PathBuf,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Public relay SSH address used by agents, e.g. relay.example.com:2222"
+        )]
         relay_addr: String,
-        #[arg(long, default_value = "home-linux")]
-        agent_id: String,
-        #[arg(long, default_value = "alice")]
+        #[arg(
+            long,
+            default_value = "alice",
+            help = "Relay SSH username for client access"
+        )]
         relay_user: String,
-        #[arg(long = "relay-authorized-key", value_name = "PATH")]
-        relay_authorized_keys: Vec<PathBuf>,
-        #[arg(long = "relay-authorized-keys", value_name = "PATH")]
-        relay_authorized_key_files: Vec<PathBuf>,
         #[arg(
             long = "relay-private-key-output",
             value_name = "PATH",
             help = "Where to write a generated relay user private key (default: slay-relay-<relay_user>.key)"
         )]
         relay_private_key_output: Option<PathBuf>,
-        #[arg(long = "agent-authorized-key", value_name = "PATH")]
-        agent_authorized_keys: Vec<PathBuf>,
-        #[arg(long = "agent-authorized-keys", value_name = "PATH")]
-        agent_authorized_key_files: Vec<PathBuf>,
-        #[arg(long = "relay-host-key", value_name = "PATH")]
-        host_key: Option<PathBuf>,
-        #[arg(long = "agent-private-key", value_name = "PATH")]
-        agent_key: Option<PathBuf>,
-        #[arg(short, long)]
+        #[arg(
+            long,
+            default_value = "home-linux",
+            help = "Agent id used as relay-side SSH username and ProxyJump host"
+        )]
+        agent_id: String,
+        #[arg(
+            short,
+            long,
+            help = "Overwrite generated output files if they already exist"
+        )]
         force: bool,
     },
     #[command(about = "Validate a config file")]
@@ -115,32 +116,16 @@ async fn main() -> Result<()> {
 fn handle_config_command(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Init {
-            relay_output,
-            agent_output,
             relay_addr,
-            agent_id,
             relay_user,
-            relay_authorized_keys,
-            relay_authorized_key_files,
             relay_private_key_output,
-            agent_authorized_keys,
-            agent_authorized_key_files,
-            host_key,
-            agent_key,
+            agent_id,
             force,
         } => write_pair_templates(PairInitOptions {
-            relay_output: &relay_output,
-            agent_output: &agent_output,
             relay_addr: &relay_addr,
-            agent_id: &agent_id,
             relay_user: &relay_user,
-            relay_authorized_keys: &relay_authorized_keys,
-            relay_authorized_key_files: &relay_authorized_key_files,
             relay_private_key_output: relay_private_key_output.as_deref(),
-            agent_authorized_keys: &agent_authorized_keys,
-            agent_authorized_key_files: &agent_authorized_key_files,
-            host_key: host_key.as_deref(),
-            agent_key: agent_key.as_deref(),
+            agent_id: &agent_id,
             force,
         }),
         ConfigCommand::Validate { target } => match target {
@@ -159,11 +144,6 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
 }
 
 fn write_template(output: &Path, content: &str, force: bool) -> Result<()> {
-    if output.as_os_str() == "-" {
-        print!("{content}");
-        return Ok(());
-    }
-
     if output.exists() && !force {
         bail!(
             "{} already exists; pass --force to overwrite it",
@@ -178,23 +158,27 @@ fn write_template(output: &Path, content: &str, force: bool) -> Result<()> {
 }
 
 struct PairInitOptions<'a> {
-    relay_output: &'a Path,
-    agent_output: &'a Path,
     relay_addr: &'a str,
-    agent_id: &'a str,
     relay_user: &'a str,
-    relay_authorized_keys: &'a [PathBuf],
-    relay_authorized_key_files: &'a [PathBuf],
     relay_private_key_output: Option<&'a Path>,
-    agent_authorized_keys: &'a [PathBuf],
-    agent_authorized_key_files: &'a [PathBuf],
-    host_key: Option<&'a Path>,
-    agent_key: Option<&'a Path>,
+    agent_id: &'a str,
     force: bool,
 }
 
 fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
-    if options.relay_output == options.agent_output {
+    write_pair_templates_to(
+        Path::new(INIT_RELAY_CONFIG_OUTPUT),
+        Path::new(INIT_AGENT_CONFIG_OUTPUT),
+        options,
+    )
+}
+
+fn write_pair_templates_to(
+    relay_output: &Path,
+    agent_output: &Path,
+    options: PairInitOptions<'_>,
+) -> Result<()> {
+    if relay_output == agent_output {
         bail!("relay_output and agent_output must be different paths");
     }
     if options.relay_addr.is_empty() {
@@ -202,8 +186,8 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
     }
     validate_agent_id(options.agent_id)?;
     validate_config_table_key("relay_user", options.relay_user)?;
-    ensure_can_write(options.relay_output, options.force)?;
-    ensure_can_write(options.agent_output, options.force)?;
+    ensure_can_write(relay_output, options.force)?;
+    ensure_can_write(agent_output, options.force)?;
     let default_output;
     let relay_private_key_output = match options.relay_private_key_output {
         Some(output) => output,
@@ -213,34 +197,21 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
         }
     };
 
-    let mut relay_authorized_keys = read_authorized_public_keys(
-        "relay authorized key",
-        options.relay_authorized_keys,
-        options.relay_authorized_key_files,
-    )?;
-    if relay_authorized_keys.is_empty() {
-        relay_authorized_keys.push(generate_relay_user_key(
-            relay_private_key_output,
-            options.relay_user,
-            options.force,
-        )?);
-    }
+    let relay_authorized_keys = vec![generate_relay_user_key(
+        relay_private_key_output,
+        options.relay_user,
+        options.force,
+    )?];
 
-    let private_key = read_or_generate_private_key("agent private key", options.agent_key)?;
+    let private_key = generate_private_key("agent private key")?;
     let agent_public_key = parse_private_key(&private_key)
         .context("invalid agent private key")?
         .public_key()
         .to_openssh()
         .context("failed to encode agent public key")?;
+    let agent_authorized_keys = vec![agent_public_key];
 
-    let mut agent_authorized_keys = read_authorized_public_keys(
-        "agent authorized key",
-        options.agent_authorized_keys,
-        options.agent_authorized_key_files,
-    )?;
-    push_unique_authorized_key(&mut agent_authorized_keys, agent_public_key);
-
-    let host_key = read_or_generate_private_key("relay host key", options.host_key)?;
+    let host_key = generate_private_key("relay host key")?;
     let host_private_key = parse_private_key(&host_key).context("invalid relay host key")?;
     let relay_listen = relay_listen_for_addr(options.relay_addr)?;
     let relay_known_hosts = vec![render_known_host_entry(
@@ -259,50 +230,12 @@ fn write_pair_templates(options: PairInitOptions<'_>) -> Result<()> {
         agent_id: options.agent_id,
     };
 
-    write_template(options.relay_output, &render_relay_config(&input), true)?;
-    write_template(options.agent_output, &render_agent_config(&input), true)?;
+    write_template(relay_output, &render_relay_config(&input), true)?;
+    write_template(agent_output, &render_agent_config(&input), true)?;
     Ok(())
 }
 
-fn read_authorized_public_keys(
-    label: &str,
-    authorized_key_paths: &[PathBuf],
-    authorized_keys_paths: &[PathBuf],
-) -> Result<Vec<String>> {
-    let mut keys = Vec::new();
-    for path in authorized_key_paths {
-        push_unique_authorized_key(&mut keys, read_single_public_key(label, path)?);
-    }
-    for path in authorized_keys_paths {
-        for key in read_authorized_keys_file(label, path)? {
-            push_unique_authorized_key(&mut keys, key);
-        }
-    }
-    Ok(keys)
-}
-
-fn read_single_public_key(label: &str, path: &Path) -> Result<String> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {label} {}", path.display()))?;
-    let keys = parse_authorized_key_lines(label, &raw, path)?;
-    match keys.as_slice() {
-        [key] => Ok(key.clone()),
-        [] => bail!("{label} {} does not contain a public key", path.display()),
-        _ => bail!(
-            "{label} {} contains multiple public keys; use an authorized_keys input for multiple keys",
-            path.display()
-        ),
-    }
-}
-
-fn read_or_generate_private_key(label: &str, path: Option<&Path>) -> Result<String> {
-    if let Some(path) = path {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {label} {}", path.display()))?;
-        parse_private_key(&raw).with_context(|| format!("invalid {label} {}", path.display()))?;
-        return Ok(raw);
-    }
-
+fn generate_private_key(label: &str) -> Result<String> {
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
         .with_context(|| format!("failed to generate {label}"))?;
     Ok(key.to_openssh(LineEnding::LF)?.to_string())
@@ -355,65 +288,6 @@ fn write_private_key_file(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_authorized_keys_file(label: &str, path: &Path) -> Result<Vec<String>> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {label} {}", path.display()))?;
-    let keys = parse_authorized_key_lines(label, &raw, path)?;
-    if keys.is_empty() {
-        bail!(
-            "{label} {} does not contain any public keys",
-            path.display()
-        );
-    }
-    Ok(keys)
-}
-
-fn parse_authorized_key_lines(label: &str, raw: &str, path: &Path) -> Result<Vec<String>> {
-    let mut keys = Vec::new();
-    for (index, line) in raw.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let key = extract_public_key_from_authorized_key_line(line)
-            .with_context(|| format!("invalid {label} {}:{}", path.display(), index + 1))?;
-        parse_public_key(&key)
-            .with_context(|| format!("invalid {label} {}:{}", path.display(), index + 1))?;
-        keys.push(key);
-    }
-    Ok(keys)
-}
-
-fn extract_public_key_from_authorized_key_line(line: &str) -> Result<String> {
-    let parts = line.split_whitespace().collect::<Vec<_>>();
-    let Some(key_type_index) = parts.iter().position(|part| is_ssh_public_key_type(part)) else {
-        bail!("missing SSH public key type");
-    };
-    if key_type_index + 1 >= parts.len() {
-        bail!("missing SSH public key body");
-    }
-    Ok(parts[key_type_index..].join(" "))
-}
-
-fn is_ssh_public_key_type(key_type: &str) -> bool {
-    matches!(
-        key_type,
-        "ssh-ed25519"
-            | "ssh-rsa"
-            | "rsa-sha2-256"
-            | "rsa-sha2-512"
-            | "sk-ssh-ed25519@openssh.com"
-            | "sk-ecdsa-sha2-nistp256@openssh.com"
-    ) || key_type.starts_with("ecdsa-sha2-")
-}
-
-fn push_unique_authorized_key(keys: &mut Vec<String>, key: String) {
-    if !keys.iter().any(|existing| existing == &key) {
-        keys.push(key);
-    }
-}
-
 fn validate_agent_id(agent_id: &str) -> Result<()> {
     if agent_id.is_empty() {
         bail!("agent_id cannot be empty");
@@ -441,7 +315,7 @@ fn validate_config_table_key(label: &str, value: &str) -> Result<()> {
 }
 
 fn ensure_can_write(output: &Path, force: bool) -> Result<()> {
-    if output.as_os_str() != "-" && output.exists() && !force {
+    if output.exists() && !force {
         bail!(
             "{} already exists; pass --force to overwrite it",
             output.display()
@@ -453,25 +327,7 @@ fn ensure_can_write(output: &Path, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh::keys::{Algorithm, PrivateKey};
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn public_key_line(comment: &str) -> String {
-        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        format!("{} {comment}", key.public_key().to_openssh().unwrap())
-    }
-
-    #[test]
-    fn parses_authorized_keys_file_style_lines() {
-        let key_a = public_key_line("laptop");
-        let key_b = public_key_line("phone");
-        let raw = format!("# relay user keys\n{key_a}\nno-pty {key_b}\n\n");
-        let parsed =
-            parse_authorized_key_lines("relay authorized key", &raw, Path::new("authorized_keys"))
-                .unwrap();
-
-        assert_eq!(parsed, vec![key_a, key_b]);
-    }
 
     #[test]
     fn init_derives_relay_listen_from_relay_addr_port() {
@@ -486,21 +342,17 @@ mod tests {
         let agent_output = dir.join("agent.toml");
         let relay_private_key_output = dir.join("relay_user.key");
 
-        write_pair_templates(PairInitOptions {
-            relay_output: &relay_output,
-            agent_output: &agent_output,
-            relay_addr: "relay.example.com:3333",
-            agent_id: "alice-home-linux",
-            relay_user: "alice",
-            relay_authorized_keys: &[],
-            relay_authorized_key_files: &[],
-            relay_private_key_output: Some(&relay_private_key_output),
-            agent_authorized_keys: &[],
-            agent_authorized_key_files: &[],
-            host_key: None,
-            agent_key: None,
-            force: false,
-        })
+        write_pair_templates_to(
+            &relay_output,
+            &agent_output,
+            PairInitOptions {
+                relay_addr: "relay.example.com:3333",
+                relay_user: "alice",
+                relay_private_key_output: Some(&relay_private_key_output),
+                agent_id: "alice-home-linux",
+                force: false,
+            },
+        )
         .unwrap();
 
         let relay_raw = fs::read_to_string(&relay_output).unwrap();
@@ -541,52 +393,6 @@ mod tests {
             Some(agent_public_key.as_str())
         );
 
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn init_respects_existing_relay_authorized_keys() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "slay-config-init-existing-key-{unique}-{}",
-            std::process::id()
-        ));
-        fs::create_dir(&dir).unwrap();
-        let relay_output = dir.join("relay.toml");
-        let agent_output = dir.join("agent.toml");
-        let relay_user_key = public_key_line("relay-user");
-        let relay_user_key_path = dir.join("relay_user.pub");
-        fs::write(&relay_user_key_path, &relay_user_key).unwrap();
-        let relay_authorized_keys = vec![relay_user_key_path];
-        let generated_key_output = dir.join("unused-generated-key.key");
-
-        write_pair_templates(PairInitOptions {
-            relay_output: &relay_output,
-            agent_output: &agent_output,
-            relay_addr: "relay.example.com:3333",
-            agent_id: "alice-home-linux",
-            relay_user: "alice",
-            relay_authorized_keys: &relay_authorized_keys,
-            relay_authorized_key_files: &[],
-            relay_private_key_output: Some(&generated_key_output),
-            agent_authorized_keys: &[],
-            agent_authorized_key_files: &[],
-            host_key: None,
-            agent_key: None,
-            force: false,
-        })
-        .unwrap();
-
-        let relay_raw = fs::read_to_string(&relay_output).unwrap();
-        let relay: toml::Value = toml::from_str(&relay_raw).unwrap();
-        assert_eq!(
-            relay["users"]["alice"]["authorized_keys"][0].as_str(),
-            Some(relay_user_key.as_str())
-        );
-        assert!(!generated_key_output.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
