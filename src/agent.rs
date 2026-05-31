@@ -24,7 +24,8 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
 
 async fn connect_once(config: AgentConfig) -> Result<()> {
     let expected_relay_known_host_fingerprints = config.relay_known_host_fingerprints()?;
-    let agent_key = parse_private_key(&config.private_key).context("invalid agent private_key")?;
+    let agent_key =
+        parse_private_key(&config.agent_private_key).context("invalid agent_private_key")?;
     let client_config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         nodelay: true,
@@ -33,7 +34,7 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
     let handler = AgentSshClient {
         expected_relay_known_host_fingerprints,
         agent_id: config.agent_id.clone(),
-        target: config.target.clone(),
+        forward_target: config.forward_target.clone(),
     };
 
     let mut session = client::connect(client_config, config.relay_addr.as_str(), handler)
@@ -57,7 +58,7 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
         .context("relay rejected agent reverse forwarding request")?;
     info!(
         agent_id = %config.agent_id,
-        target = %config.target,
+        forward_target = %config.forward_target,
         "agent registered SSH reverse forwarding"
     );
 
@@ -67,7 +68,7 @@ async fn connect_once(config: AgentConfig) -> Result<()> {
 struct AgentSshClient {
     expected_relay_known_host_fingerprints: HashSet<String>,
     agent_id: String,
-    target: String,
+    forward_target: String,
 }
 
 impl client::Handler for AgentSshClient {
@@ -97,11 +98,11 @@ impl client::Handler for AgentSshClient {
             );
         }
 
-        let target = self.target.clone();
+        let forward_target = self.forward_target.clone();
         let agent_id = self.agent_id.clone();
         let originator_address = originator_address.to_string();
         tokio::spawn(async move {
-            if let Err(err) = forward_channel_to_target(channel, &target).await {
+            if let Err(err) = forward_channel_to_target(channel, &forward_target).await {
                 debug!(
                     agent_id,
                     originator_address,

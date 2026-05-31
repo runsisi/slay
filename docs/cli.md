@@ -26,11 +26,10 @@ slay config init \
   --agent-output slay-agent.toml \
   --relay-addr relay.example.com:2222 \
   --relay-user alice \
-  --relay-authorized-key ~/.ssh/id_relay_user.pub \
   --agent-id alice-home-linux
 ```
 
-`--relay-addr` is the SSH address used by the agent to connect back to the relay. `config init` uses its port for the generated relay `[server].listen` wildcard bind address. It generates both the relay host key and the agent key by default, embeds the private keys in the generated configs, and writes the matching public keys into `relay_known_hosts` and `agent_authorized_keys`.
+`--relay-addr` is the SSH address used by the agent to connect back to the relay. `config init` uses the relay address port for the generated relay `[relay].listen` wildcard bind address. It generates the relay host key, the agent key, and the relay user key by default, embeds the role keys in the generated configs, writes the relay user public key into `authorized_keys`, and writes the agent public key into `agent_authorized_keys`. The generated relay user private key defaults to `slay-relay-<relay_user>.key`, for example `slay-relay-alice.key`; use it in your SSH client.
 
 Embed existing relay or agent private keys instead of generating them:
 
@@ -60,6 +59,15 @@ slay config init \
   --agent-authorized-keys ./agent_authorized_keys
 ```
 
+Choose where the generated relay user key is written:
+
+```bash
+slay config init \
+  --relay-addr relay.example.com:2222 \
+  --relay-user alice \
+  --relay-private-key-output ./alice-relay.key
+```
+
 Set the agent id during paired generation:
 
 ```bash
@@ -70,31 +78,7 @@ slay config init \
   --agent-id alice-home-linux
 ```
 
-If relay user keys are omitted, `config init` writes placeholders. Replace them before validating or running.
-
-Generate a relay config:
-
-```bash
-slay config gen relay --output slay-relay.toml
-```
-
-Generate an agent config:
-
-```bash
-slay config gen agent --output slay-agent.toml
-```
-
-Overwrite an existing generated config:
-
-```bash
-slay config gen relay --output slay-relay.toml --force
-```
-
-Print generated config to stdout:
-
-```bash
-slay config gen relay --output -
-```
+If relay user keys are omitted, `config init` generates a relay user key pair and fills `[users.<name>].authorized_keys` with the generated public key. Use `--relay-authorized-key` or `--relay-authorized-keys` when you already have SSH client keys.
 
 Validate configs:
 
@@ -115,15 +99,14 @@ slay config init \
   --agent-output slay-agent.toml \
   --relay-addr relay.example.com:2222 \
   --relay-user alice \
-  --relay-authorized-key ~/.ssh/id_ed25519.pub \
   --agent-id alice-home-linux
 ```
 
 3. Edit `slay-relay.toml`:
 
-- Confirm `[server].listen`.
-- Protect `slay-relay.toml`; `[server].host_key` contains the relay SSH host private key.
-- Confirm `[users.<name>].authorized_keys`.
+- Confirm `[relay].listen`.
+- Protect `slay-relay.toml`; `[relay].host_key` contains the relay SSH host private key.
+- Confirm `[users.<name>].authorized_keys`; if you did not pass existing keys, use the generated relay user private key with your SSH client.
 - Confirm `[agents.<agent_id>].agent_authorized_keys` contains the agent public key derived from `slay-agent.toml`.
 - Keep each `[agents.<agent_id>]` table key unique.
 
@@ -132,7 +115,8 @@ slay config init \
 - Confirm `relay_addr`.
 - Confirm `relay_known_hosts` contains the relay address and SSH host public key.
 - Confirm `agent_id` matches the relay `[agents.<agent_id>]` entry.
-- Protect `slay-agent.toml`; `private_key` contains the agent SSH private key.
+- Protect `slay-agent.toml`; `agent_private_key` contains the agent SSH private key.
+- Confirm `forward_target` points at the local SSH server behind the agent.
 
 5. Validate both configs:
 

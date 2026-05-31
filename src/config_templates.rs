@@ -1,47 +1,3 @@
-pub const RELAY_CONFIG_TEMPLATE: &str = r#"# slay relay config
-
-[server]
-listen = "0.0.0.0:2222"
-host_key = '''
------BEGIN OPENSSH PRIVATE KEY-----
-REPLACE_WITH_RELAY_HOST_PRIVATE_KEY
------END OPENSSH PRIVATE KEY-----
-'''
-
-[users.alice]
-# Replace with the SSH client keys allowed to use the relay.
-authorized_keys = [
-  "ssh-ed25519 REPLACE_WITH_RELAY_USER_AUTHORIZED_KEY alice@example"
-]
-allowed_agents = [
-  "alice-home-linux"
-]
-
-[agents.alice-home-linux]
-# Replace with the public key for this agent.
-agent_authorized_keys = [
-  "ssh-ed25519 REPLACE_WITH_AGENT_AUTHORIZED_KEY alice-home-agent"
-]
-target = "127.0.0.1:22"
-"#;
-
-pub const AGENT_CONFIG_TEMPLATE: &str = r#"# slay agent config
-
-relay_addr = "relay.example.com:2222"
-relay_known_hosts = [
-  "[relay.example.com]:2222 ssh-ed25519 REPLACE_WITH_RELAY_HOST_PUBLIC_KEY relay@example"
-]
-
-agent_id = "alice-home-linux"
-private_key = '''
------BEGIN OPENSSH PRIVATE KEY-----
-REPLACE_WITH_AGENT_PRIVATE_KEY
------END OPENSSH PRIVATE KEY-----
-'''
-target = "127.0.0.1:22"
-reconnect_secs = 5
-"#;
-
 pub struct PairTemplateInput<'a> {
     pub relay_user: &'a str,
     pub relay_authorized_keys: &'a [String],
@@ -50,7 +6,7 @@ pub struct PairTemplateInput<'a> {
     pub relay_addr: &'a str,
     pub host_key: &'a str,
     pub relay_known_hosts: &'a [String],
-    pub private_key: &'a str,
+    pub agent_private_key: &'a str,
     pub agent_id: &'a str,
 }
 
@@ -65,7 +21,7 @@ pub fn render_relay_config(input: &PairTemplateInput<'_>) -> String {
     format!(
         r#"# slay relay config
 
-[server]
+[relay]
 listen = {relay_listen}
 host_key = {host_key}
 
@@ -83,7 +39,7 @@ allowed_agents = [
 agent_authorized_keys = [
 {agent_authorized_keys}
 ]
-target = "127.0.0.1:22"
+forward_target = "127.0.0.1:22"
 "#,
     )
 }
@@ -92,7 +48,7 @@ pub fn render_agent_config(input: &PairTemplateInput<'_>) -> String {
     let relay_addr = toml_string(input.relay_addr);
     let relay_known_hosts = render_toml_array_items(input.relay_known_hosts);
     let agent_id = toml_string(input.agent_id);
-    let private_key = toml_multiline_literal(input.private_key);
+    let agent_private_key = toml_multiline_literal(input.agent_private_key);
     format!(
         r#"# slay agent config
 
@@ -102,8 +58,8 @@ relay_known_hosts = [
 ]
 
 agent_id = {agent_id}
-private_key = {private_key}
-target = "127.0.0.1:22"
+agent_private_key = {agent_private_key}
+forward_target = "127.0.0.1:22"
 reconnect_secs = 5
 "#,
     )
@@ -130,16 +86,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relay_template_is_toml() {
-        toml::from_str::<toml::Value>(RELAY_CONFIG_TEMPLATE).unwrap();
-    }
-
-    #[test]
-    fn agent_template_is_toml() {
-        toml::from_str::<toml::Value>(AGENT_CONFIG_TEMPLATE).unwrap();
-    }
-
-    #[test]
     fn rendered_pair_templates_are_toml() {
         let relay_authorized_keys = vec!["ssh-ed25519 AAAA alice@example".to_string()];
         let agent_authorized_keys = vec!["ssh-ed25519 BBBB alice-home-agent".to_string()];
@@ -153,7 +99,7 @@ mod tests {
             relay_addr: "relay.example.com:2222",
             host_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nCCCC\n-----END OPENSSH PRIVATE KEY-----\n",
             relay_known_hosts: &relay_known_hosts,
-            private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+            agent_private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
             agent_id: "alice-home-linux",
         };
         toml::from_str::<toml::Value>(&render_relay_config(&input)).unwrap();
@@ -177,7 +123,7 @@ mod tests {
             relay_addr: "relay.example.com:2222",
             host_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nDDDD\n-----END OPENSSH PRIVATE KEY-----\n",
             relay_known_hosts: &relay_known_hosts,
-            private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+            agent_private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
             agent_id: "alice-home-linux",
         };
         let raw = render_relay_config(&input);

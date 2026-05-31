@@ -142,14 +142,14 @@ async fn run_listener(state: RelayState) -> Result<()> {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         auth_rejection_time: Duration::from_secs(3),
         auth_rejection_time_initial: Some(Duration::ZERO),
-        keys: vec![state.config.server.host_key.clone()],
+        keys: vec![state.config.relay.host_key.clone()],
         ..Default::default()
     };
     let config = Arc::new(config);
-    let listener = TcpListener::bind(state.config.server.listen)
+    let listener = TcpListener::bind(state.config.relay.listen)
         .await
-        .with_context(|| format!("failed to bind listener {}", state.config.server.listen))?;
-    info!("listener bound to {}", state.config.server.listen);
+        .with_context(|| format!("failed to bind listener {}", state.config.relay.listen))?;
+    info!("listener bound to {}", state.config.relay.listen);
     let mut server = SshRelayServer { state };
     server.run_on_socket(config, &listener).await?;
     Ok(())
@@ -484,7 +484,7 @@ mod tests {
         let host_key = private_key_block();
         let raw = format!(
             r#"
-[server]
+[relay]
 listen = "127.0.0.1:2222"
 host_key = '''{host_key}'''
 
@@ -494,11 +494,11 @@ allowed_agents = ["alice-home-linux"]
 
 [agents.alice-home-linux]
 agent_authorized_keys = ["{agent_key_a}"]
-target = "127.0.0.1:22"
+forward_target = "127.0.0.1:22"
 
 [agents.bob-home-linux]
 agent_authorized_keys = ["{agent_key_b}"]
-target = "127.0.0.1:22"
+forward_target = "127.0.0.1:22"
 "#
         );
         RelayConfig::from_toml_str(&raw).unwrap()

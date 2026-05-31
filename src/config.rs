@@ -11,7 +11,7 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfigFile {
-    pub server: RelayServerConfig,
+    pub relay: RelayServerConfig,
     #[serde(default)]
     pub users: HashMap<String, RelayUserConfig>,
     #[serde(default)]
@@ -39,12 +39,12 @@ pub struct RelayUserConfig {
 pub struct RelayAgentConfig {
     #[serde(default)]
     pub agent_authorized_keys: Vec<String>,
-    pub target: String,
+    pub forward_target: String,
 }
 
 #[derive(Clone)]
 pub struct RelayConfig {
-    pub server: RuntimeRelayServerConfig,
+    pub relay: RuntimeRelayServerConfig,
     users: Arc<HashMap<String, RuntimeRelayUser>>,
     agents_by_id: Arc<HashMap<String, RuntimeAgent>>,
 }
@@ -52,7 +52,7 @@ pub struct RelayConfig {
 impl std::fmt::Debug for RelayConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RelayConfig")
-            .field("listen", &self.server.listen)
+            .field("listen", &self.relay.listen)
             .field("users", &self.users.keys().collect::<Vec<_>>())
             .field("agents", &self.agents_by_id.keys().collect::<Vec<_>>())
             .finish()
@@ -84,8 +84,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub relay_known_hosts: Vec<String>,
     pub agent_id: String,
-    pub private_key: String,
-    pub target: String,
+    pub agent_private_key: String,
+    pub forward_target: String,
     #[serde(default = "default_reconnect_secs")]
     pub reconnect_secs: u64,
 }
@@ -96,8 +96,8 @@ impl std::fmt::Debug for AgentConfig {
             .field("relay_addr", &self.relay_addr)
             .field("relay_known_hosts", &self.relay_known_hosts)
             .field("agent_id", &self.agent_id)
-            .field("private_key", &"<redacted>")
-            .field("target", &self.target)
+            .field("agent_private_key", &"<redacted>")
+            .field("forward_target", &self.forward_target)
             .field("reconnect_secs", &self.reconnect_secs)
             .finish()
     }
@@ -127,8 +127,7 @@ impl RelayConfig {
         if file.agents.is_empty() {
             bail!("relay config must define at least one agent");
         }
-        let host_key =
-            parse_private_key(&file.server.host_key).context("invalid server host_key")?;
+        let host_key = parse_private_key(&file.relay.host_key).context("invalid relay host_key")?;
 
         let mut agents_by_id = HashMap::new();
         for (agent_id, agent) in file.agents {
@@ -136,8 +135,8 @@ impl RelayConfig {
             if agent.agent_authorized_keys.is_empty() {
                 bail!("agent {agent_id} must have at least one agent authorized key");
             }
-            if agent.target != "127.0.0.1:22" {
-                bail!("agent {agent_id} target must be 127.0.0.1:22 for the SSH-only MVP");
+            if agent.forward_target != "127.0.0.1:22" {
+                bail!("agent {agent_id} forward_target must be 127.0.0.1:22 for the SSH-only MVP");
             }
             let mut agent_key_fingerprints = HashSet::new();
             for public_key in &agent.agent_authorized_keys {
@@ -190,8 +189,8 @@ impl RelayConfig {
         }
 
         Ok(Self {
-            server: RuntimeRelayServerConfig {
-                listen: file.server.listen,
+            relay: RuntimeRelayServerConfig {
+                listen: file.relay.listen,
                 host_key,
             },
             users: Arc::new(users),
@@ -246,12 +245,12 @@ impl AgentConfig {
         }
         self.relay_known_host_fingerprints()?;
         validate_identifier("agent_id", &self.agent_id)?;
-        parse_private_key(&self.private_key).context("invalid private_key")?;
+        parse_private_key(&self.agent_private_key).context("invalid agent_private_key")?;
         if self.reconnect_secs == 0 {
             bail!("reconnect_secs must be at least 1");
         }
-        if self.target != "127.0.0.1:22" {
-            bail!("agent target must be 127.0.0.1:22 for the SSH-only MVP");
+        if self.forward_target != "127.0.0.1:22" {
+            bail!("agent forward_target must be 127.0.0.1:22 for the SSH-only MVP");
         }
         Ok(())
     }
@@ -412,7 +411,7 @@ mod tests {
         let host_key = private_key_block();
         format!(
             r#"
-[server]
+[relay]
 listen = "127.0.0.1:2222"
 host_key = '''{}'''
 
@@ -422,7 +421,7 @@ allowed_agents = ["{}"]
 
 [agents.{}]
 agent_authorized_keys = ["{}"]
-target = "127.0.0.1:22"
+forward_target = "127.0.0.1:22"
 "#,
             host_key, user_key, agent_id, agent_id, agent_key
         )
@@ -456,9 +455,11 @@ target = "127.0.0.1:22"
     }
 
     #[test]
-    fn rejects_non_ssh_target() {
-        let raw = base_config("alice-home-linux")
-            .replace("target = \"127.0.0.1:22\"", "target = \"127.0.0.1:8080\"");
+    fn rejects_non_ssh_forward_target() {
+        let raw = base_config("alice-home-linux").replace(
+            "forward_target = \"127.0.0.1:22\"",
+            "forward_target = \"127.0.0.1:8080\"",
+        );
         let err = RelayConfig::from_toml_str(&raw).unwrap_err();
         assert!(err.to_string().contains("127.0.0.1:22"));
     }
@@ -477,7 +478,7 @@ target = "127.0.0.1:22"
     }
 
     #[test]
-    fn rejects_unknown_relay_server_field() {
+    fn rejects_unknown_relay_field() {
         let raw = base_config("alice-home-linux").replace(
             "listen = \"127.0.0.1:2222\"",
             "listen = \"127.0.0.1:2222\"\nunexpected_field = true",
@@ -494,13 +495,39 @@ relay_addr = "relay.example.com:2222"
 relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
 unexpected_field = true
 agent_id = "alice-home-linux"
+agent_private_key = '''PRIVATE_KEY'''
+forward_target = "127.0.0.1:22"
+"#
+        .replace("RELAY_KEY", &relay_key)
+        .replace("PRIVATE_KEY", &private_key_block());
+        let err = toml::from_str::<AgentConfig>(&raw).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_old_agent_config_field_names() {
+        let relay_key = public_key_line();
+        let raw = r#"
+relay_addr = "relay.example.com:2222"
+relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
+agent_id = "alice-home-linux"
 private_key = '''PRIVATE_KEY'''
 target = "127.0.0.1:22"
 "#
         .replace("RELAY_KEY", &relay_key)
         .replace("PRIVATE_KEY", &private_key_block());
         let err = toml::from_str::<AgentConfig>(&raw).unwrap_err();
-        assert!(err.to_string().contains("unknown field"));
+        assert!(format!("{err:#}").contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_old_relay_agent_target_field() {
+        let raw = base_config("alice-home-linux").replace(
+            "forward_target = \"127.0.0.1:22\"",
+            "target = \"127.0.0.1:22\"",
+        );
+        let err = RelayConfig::from_toml_str(&raw).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown field"));
     }
 
     #[test]
@@ -526,8 +553,8 @@ target = "127.0.0.1:22"
 relay_addr = "relay.example.com:2222"
 relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
 agent_id = "mch_01"
-private_key = '''PRIVATE_KEY'''
-target = "127.0.0.1:22"
+agent_private_key = '''PRIVATE_KEY'''
+forward_target = "127.0.0.1:22"
 reconnect_secs = 0
 "#
         .replace("RELAY_KEY", &relay_key)
@@ -544,8 +571,8 @@ reconnect_secs = 0
 relay_addr = "relay.example.com:2222"
 relay_known_hosts = ["[relay.example.com]:2222 RELAY_KEY"]
 agent_id = "mch_01"
-private_key = '''PRIVATE_KEY'''
-target = "127.0.0.1:22"
+agent_private_key = '''PRIVATE_KEY'''
+forward_target = "127.0.0.1:22"
 "#
         .replace("RELAY_KEY", &relay_key)
         .replace("PRIVATE_KEY", &private_key_block());
@@ -560,8 +587,8 @@ target = "127.0.0.1:22"
 relay_addr = "relay.example.com:2222"
 relay_known_hosts = ["[other.example.com]:2222 RELAY_KEY"]
 agent_id = "mch_01"
-private_key = '''PRIVATE_KEY'''
-target = "127.0.0.1:22"
+agent_private_key = '''PRIVATE_KEY'''
+forward_target = "127.0.0.1:22"
 "#
         .replace("RELAY_KEY", &relay_key)
         .replace("PRIVATE_KEY", &private_key_block());
