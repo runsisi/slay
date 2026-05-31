@@ -430,11 +430,13 @@ impl server::Handler for SshRelaySession {
 
     async fn data(
         &mut self,
-        channel: ChannelId,
+        _channel: ChannelId,
         _data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        warn!(?channel, "unexpected handler-level data event");
+        // russh delivers data to the Channel receiver and also calls this hook.
+        // Accepted proxy channels are copied from Channel::into_stream(), so
+        // there is nothing else to do here.
         Ok(())
     }
 
